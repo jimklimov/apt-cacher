@@ -300,7 +300,7 @@ sub import {
 	@namespaces = (undef) unless @namespaces;
       NAMESPACE:
 	foreach (@namespaces) {
-	
+
 	    my $package_dir = join('/', grep {defined} $cfg->{cache_dir}, 'packages', $_);
 	    my $header_dir = join('/', grep {defined} $cfg->{cache_dir}, 'headers', $_);
 
@@ -334,7 +334,7 @@ sub import {
 		    write_header("$header_dir/$targetfile",
 				 HTTP::Response->new(200, 'OK', ['Date' => $headerdate,
 								 'Last-Modified' => $headerdate,
-								 'Content-Length' => -s $packagefile]));
+								 'Content-Length' => -s "$package_dir/$targetfile"]));
 		}
 
 		# copy the ownership of the private directory

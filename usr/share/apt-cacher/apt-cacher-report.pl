@@ -252,7 +252,7 @@ $output .= "<h2 align=\"center\">cache efficiency</h2>
 <tr bgcolor=\"#cccccc\"><td bgcolor=\"#ccccff\"> Requests </td><td>$hit_count ($hit_count_percent%)</td><td>$miss_count ($miss_count_percent%)</td><td>$total_count</td></tr>\n
 <tr bgcolor=\"#cccccc\"><td bgcolor=\"#ccccff\"> Transfers </td><td>$hit_trafficstring ($hit_data_percent%)</td><td>$miss_trafficstring ($miss_data_percent%)</td><td>$total_trafficstring</td></tr>\n
 </table>";
-	
+
 $output .= "</body></html>\n";
 
 #print $output;

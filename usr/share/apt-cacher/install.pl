@@ -80,8 +80,8 @@ for ("README", "README.txt") {
 if ($cfg->{checksum}) {
     require('apt-cacher-cs.pl');
     setup_ownership();
-    print "Running database recovery...";
-    db_recover();
+    print "Clearing database locks...";
+    db(1); # Connect without environment lock which runs failchk()
     print "Done!\n";
     if (my $sem = get_existing_sem()) { # Existing only
 	print "Clearing semaphore block\n";

@@ -1,0 +1,5 @@
+/etc/apt-cacher/apache.conf
+/etc/apt-cacher/apt-cacher.conf
+/etc/cron.d/apt-cacher
+/etc/init.d/apt-cacher
+/etc/logrotate.d/apt-cacher

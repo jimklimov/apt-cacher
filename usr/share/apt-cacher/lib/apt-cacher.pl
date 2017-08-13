@@ -8,15 +8,20 @@
 use strict;
 use warnings;
 use POSIX ();
-use Fcntl qw/:DEFAULT :flock/;
-use FreezeThaw qw(freeze thaw);
+use Fcntl qw/O_CREAT O_WRONLY :flock/;
+use Storable ();
+use Socket ();
 use HTTP::Response;
+use Dpkg::Arch;
 use URI;
 use IO::Uncompress::AnyUncompress qw($AnyUncompressError);
 use Module::Load::Conditional;
 use File::Spec;
+use File::Path ();
 use Carp;
 our $cfg;
+
+umask 0022;
 
 sub read_config {
 
@@ -47,74 +52,128 @@ sub read_config {
 		  generate_reports => 1,
 		  group => eval {my $g = $); $g =~ s/\s.*$//; $g},
 		  http_proxy => '',
-		  http_proxy_auth => '',
+		  libcurl_socket => '/var/run/apt-cacher/libcurl.socket',
 		  limit => 0,
 		  limit_global => 0,
 		  log_dir => '/var/log/apt-cacher',
 		  request_empty_lines => 5,
-		  request_timeout => 30,
+		  request_timeout => 10,
 		  return_buffer_size => 1048576, # 1Mb
 		  reverse_path_map => 1,
-		  ubuntu_release_names => join(', ', qw(dapper edgy feisty gutsy hardy intrepid jaunty karmic lucid maverick natty oneiric precise quantal)),
-		  use_proxy => 0,
-		  use_proxy_auth => 0,
+		  supported_archs => join(', ', qw(
+						      avr32
+						      amd64
+						      alpha
+						      arm
+						      arm64
+						      armel
+						      armhf
+						      hppa
+						      hurd-i386
+						      i386
+						      ia64
+						      kfreebsd-amd64
+						      kfreebsd-i386
+						      m32r
+						      m68k
+						      mips
+						      mipsel
+						      netbsd-alpha
+						      netbsd-i386
+						      powerpc
+						      powerpcspe
+						      ppc64
+						      s390
+						      s390x
+						      sh4
+						      sparc
+						      sparc64
+						      x32
+						 )),
+		  ubuntu_release_names => join(', ', qw(
+							   dapper
+							   edgy
+							   feisty
+							   gutsy
+							   hardy
+							   intrepid
+							   jaunty
+							   karmic
+							   lucid
+							   maverick
+							   natty
+							   oneiric
+							   precise
+							   quantal
+							   raring
+							   saucy
+							   trusty
+							   utopic
+							   vivid
+							   wily
+							   xenial
+							   yakkety
+							   zesty
+						      )),
 		  user => $>,
 
 		  # Private
 		  _config_file => $config_file,
 		  _path_map => {
-				'debian-changelogs' => ['packages.debian.org'],
-				'ubuntu-changelogs' => ['changelogs.ubuntu.com']
+				'debian-changelogs' => ['packages.debian.org', 'metadata.ftp-master.debian.org'],
+				'debian-appstream' => ['appstream.debian.org'],
+				'ubuntu-changelogs' => ['changelogs.ubuntu.com'],
+				'ubuntu-appstream' => ['appstream.ubuntu.com']
 			       },
 
 		  # Regexps
-		  checksum_files_regexp => '^(?:' . join('|',
-							 qw(Packages(?:\.gz|\.bz2)?
-							    Sources(?:\.gz|\.bz2)?
+		  checksum_files_regexp => '(?:^|/)(?:' . join('|',
+							 qw((?:Sources|Packages)(?:\.(?:x|g)z|\.bz2)?
 							    (?:In)?Release
 							    Index(?:\.bz2)?
 							  )
-							) . ')$',
-		  skip_checksum_files_regexp => '^(?:' . join('|',
+							      ) . ')$',
+		  skip_checksum_files_regexp => '(?:^|/)(?:' . join('|',
 							qw((?:In)?Release
 							   Release\.gpg
 							 )
-						       ) . ')$',
-		  index_files_regexp => '^(?:' . join('|',
+								   ) . ')$',
+		  index_files_regexp => '(?:^|/)(?:' . join('|',
 						      qw(Index(?:\.bz2)?
-							 Packages(?:\.gz|\.bz2)?
+							 (?:Sources|Packages|release)(?:\.(?:x|g)z|\.bz2)?
 							 Release(?:\.gpg)?
 							 InRelease
-							 Sources(?:\.gz|\.bz2)?
 							 Contents-(?:[a-z]+-)?[a-zA-Z0-9]+\.gz
 							 (?:srclist|pkglist)\.[a-z-]+\.bz2
-							 release(?:\.gz|\.bz2)?
+							 Components-%VALID_ARCHS%\.yml\.(?:x|g)z
+							 icons-(64|128)x\g{-1}\.tar\.(?:x|g)z
 						       ),
 						      # This needs to be a separate item to avoid a warning from the
 						      # comma within qw()
-						      q(Translation-[a-z]{2,3}(?:_[A-Z]{2})?(?:\.gz|\.bz2|\.xz)?)
-						     ) . ')$',
-		  installer_files_regexp => '^(?:' . join('|',
+						      q(Translation-[a-z]{2,3}(?:_[A-Z]{2}(?:\.[a-zA-Z0-9-]+)?)?(?:\.gz|\.bz2|\.xz|\.lzma)?)
+							   ) . ')$',
+		  installer_files_regexp => '(?:^|/)(?:' . join('|',
 							  qw(vmlinuz
 							     linux
 							     initrd\.gz
-							     changelog
-							     NEWS.Debian
-							     UBUNTU_RELEASE_NAMES\.tar\.gz(?:\.gpg)?
+							     (?:%VALID_PACKAGE_NAME%_%VALID_VERSION%[_\.])?changelog
+							     NEWS\.Debian
+							     %VALID_UBUNTU_RELEASE_NAMES%\.tar\.gz(?:\.gpg)?
+							     (?:by-hash/(?i:MD5SUM/[0-9a-f]{32}|SHA1/[0-9a-f]{40}|SHA256/[0-9a-f]{64}))
 							     (?:Devel|EOL)?ReleaseAnnouncement(?:\.html)?
 							     meta-release(?:-lts)?(?:-(?:development|proposed))?
 							   )
-							 ) . ')$',
+							       ) . ')$',
 		  package_files_regexp => '(?:' . join('|',
-						       qw(^[-+.a-z0-9]+_(?:\d:)?[-+.~a-zA-Z0-9]+(?:_[-a-z0-9]+\.(?:u|d)?deb|\.dsc|\.tar(?:\.gz|\.bz2|\.xz)|\.diff\.gz)
+						       qw((?:^|/)%VALID_PACKAGE_NAME%_%VALID_VERSION%(?:_%VALID_ARCHS%\.(?:u|d)?deb|\.dsc|\.tar\.(?:gz|bz2|xz|lzma)(?:\.asc)?|\.diff\.gz)
 							  \.rpm
 							  index\.db-.+\.gz
 							  \.jigdo
 							  \.template
 							)
 						      ) .')$',
-		  pdiff_files_regexp => '^2\d{3}-\d{2}-\d{2}-\d{4}\.\d{2}\.gz$',
-		  soap_url_regexp => '^(?:http://)?bugs\.debian\.org(?::80)?/cgi-bin/soap.cgi$',
+		  pdiff_files_regexp => '(?:^|/)2\d{3}-\d{2}-\d{2}-\d{4}\.\d{2}\.gz$',
+		  soap_url_regexp => '^(?:http://)?bugs\.debian\.org(?::80)?/cgi-bin/soap\.cgi$',
 		 );
 
   CONFIGFILE:
@@ -146,8 +205,8 @@ sub read_config {
 			  warn "Invalid configuration line in $file: \Q$_\E. Skipping file\n";
 			  next CONFIGFILE;
 		      }
-		  }	
-	
+		  }
+
 		  if (my ($key, $value) = split(/\s*=\s*/)) { # split into key and value pair
 		      if ($key =~ /^_/) {
 			  warn "Can't set private configuration option $key. Ignoring\n";
@@ -175,7 +234,9 @@ sub read_config {
 
 sub cfg_split {
     my ($item) = @_;
-    return $item ? grep {!/^$/} split(/\s*[,;]\s*/, $item) : undef;
+    return $item ? grep {length} # Remove empty
+      map {(my $s = $_) =~ s#\\(?=[,;])##g; $s} # Normalise escaped separators
+	split(/\s*(?<!\\)[,;]\s*/, $item) : undef;
 }
 
 sub private_config {
@@ -198,7 +259,7 @@ sub private_config {
     # Handle libcurl configuration
     if ($cfg->{libcurl}) {
         for (cfg_split($cfg->{libcurl})) {
-	    my @tmp = split(/\s+/, $_);
+	    my @tmp = split(/\s+/, $_, 2);
 	    next unless my $key=uc(shift(@tmp));
 	    if (@tmp) {
 		$cfg->{_libcurl}{$key} = shift(@tmp);
@@ -206,25 +267,52 @@ sub private_config {
 	}
     }
 
-    # Expand PATH_MAP in allowed_hosts
+    # Expand %PATH_MAP% in allowed_locations.
+    # Still support legacy PATH_MAP.
     if ($cfg->{allowed_locations}) {
-        $cfg->{allowed_locations} =~ s/\bPATH_MAP\b/join(', ', keys %{$cfg->{_path_map}})/ge;
+        $cfg->{allowed_locations} =~ s/(?:\b|%)PATH_MAP(?:%|\b)/join(', ', keys %{$cfg->{_path_map}})/ge;
     }
 
-    # Expand UBUNTU_RELEASE_NAMES in installer_files_regexp
-    $cfg->{installer_files_regexp} =~ s/UBUNTU_RELEASE_NAMES/'(?:'
-      . join('|',
-	     grep { m%[^a-z]% ? warn "Ignoring invalid Ubuntu release: $_\n" : $_ }
-	     cfg_split($cfg->{ubuntu_release_names}))
-	. ')'/ge;
+    # Handle regexp expansions
+    my %valid_expansion = (
+			   package_name => '[a-z0-9][-+.a-z0-9]*',
+			   version => '(?:\d+:)?[0-9][-+:.~a-zA-Z0-9]*',
+			   archs => '(?:' . join('|',
+						 do {
+						     # Check config list is valid architecure
+						     my %v = map { $_ => 1 } Dpkg::Arch::get_valid_arches;
+						     grep { warn "Ignoring invalid architecture in supported_archs: $_\n" unless $v{$_};
+							    $v{$_};
+							}
+						       cfg_split($cfg->{supported_archs});
+						 } , 'all') . ')',
+			   ubuntu_release_names => '(?:' . join('|',
+								# Only allow lowercase alphanumeric Ubuntu release names
+								grep  { my $invalid = m%[^a-z]% && warn "Ignoring invalid Ubuntu release: $_\n";
+									!$invalid ; # Return negated match status
+								    }
+								cfg_split($cfg->{ubuntu_release_names})) .
+			   ')'
+			  );
+    foreach my $regexp_name (glob('{{{skip_,}checksum,index,installer,package,pdiff}_files,soap_url}_regexp')) {
 
-    # Precompile regexps so they will not be recompiled each time
-    $cfg->{$_} = qr/$cfg->{$_}/ foreach glob('{{{skip_,}checksum,index,installer,package,pdiff}_files,soap_url}_regexp');
+	for ($cfg->{$regexp_name}) {
+
+	    # Legacy support for UBUNTU_RELEASE_NAMES
+	    s/\bUBUNTU_RELEASE_NAMES(?!%)/%VALID_UBUNTU_RELEASE_NAMES%/g if $regexp_name eq 'installer_files_regexp';
+
+	    # Expand %VALID_*%
+	    foreach my $key (keys %valid_expansion){
+		s/%VALID_\U$key%/$valid_expansion{$key}/g
+	    }
+
+	}
+    }
 
 
     if ($cfg->{interface}) {
 	# If we can't resolve item, see if it is an interface name
-	unless (inet_aton($cfg->{interface})) {
+	unless (Socket::inet_aton($cfg->{interface})) {
 	    require IO::Interface::Simple;
 	    my $if = IO::Interface::Simple->new($cfg->{interface});
 	    if ($if) {
@@ -237,12 +325,46 @@ sub private_config {
     }
 
     # Proxy support
-    foreach ('proxy', 'proxy_auth') {
-        if ($cfg->{"use_$_"} && !$cfg->{"http_$_"}) {
-	    warn "use_$_ specified without http_$_ being set. Disabling.";
-	    $cfg->{"use_$_"}=0;
+    for ($cfg->{http_proxy}) {
+	last unless length;
+
+	# Legacy use_proxy warning
+	if (exists $cfg->{use_proxy} && !$cfg->{use_proxy}) {
+	    warn 'Legacy use_proxy=0 is deprecated and is slated for removal. Unset http_proxy if upstream proxy not required';
+	    last; # But still honour it
 	}
+
+	$cfg->{_proxy} = URI->new((m!^[^:/?#]+://! ? '' : 'http://') . $_);
+	if ($cfg->{_proxy}) {
+	    # Clear any path
+	    $cfg->{_proxy}->path(undef);
+
+	    # Legacy proxy authorisation
+	    if ($cfg->{http_proxy_auth}) {
+
+		# Legacy use_proxy_auth warning
+		if (exists $cfg->{use_proxy_auth} && !$cfg->{use_proxy_auth}) {
+		    warn 'Legacy use_proxy_auth=0 is deprecated and is slated for removal. Unset http_proxy_auth if upstream proxy authentication not required';
+		}
+		else {
+		    if ($cfg->{_proxy}->userinfo) {
+			warn 'Upstream proxy authorisation already set, ignoring deprecated http_proxy_auth';
+		    }
+		    else {
+			$cfg->{_proxy}->userinfo($cfg->{http_proxy_auth});
+		    }
+		}
+	    }
+	}
+	else {
+	    info_message("Warning: failed to parse http_proxy $cfg->{http_proxy} as URI. Ignoring.");
+	}
+        # Hide auth details so they don't appear in /config
+	m%[^/?#]+(?=@)% && substr ($_, $-[0], $+[0] - $-[0]) =~ tr/:/*/c;
     }
+    # Hide legacy auth details so they don't appear in /config
+    $cfg->{http_proxy_auth} =~ tr/:/*/c if exists $cfg->{http_proxy_auth};
+
 
     # Rate limit and disk_usage_limit support
     foreach (qw(limit disk_usage_limit)) {
@@ -274,7 +396,7 @@ sub expand_byte_suffix {
 
     for ($bstring) {
 	/^(\d+)$/ && do {$ret = $1; last};
-	
+
 	/^(\d+)\s*kB?$/ && do {$ret = $1 * 1000; last};
 	/^(\d+)\s*Ki?B?$/ && do {$ret = $1 * 1024; last};
 
@@ -306,24 +428,31 @@ sub check_install {
     my @dir = ($cfg->{cache_dir}, $cfg->{log_dir}, "$cfg->{cache_dir}/private",
 		     "$cfg->{cache_dir}/import", "$cfg->{cache_dir}/packages",
 		     "$cfg->{cache_dir}/headers");
+
+    # Check pidfile and libcurl socket directories
+    for (qw/_pidfile libcurl_socket/) {
+        push @dir, (File::Spec->splitpath($cfg->{$_}))[1] if defined $cfg->{$_};
+    };
+
     foreach my $dir (@dir) {
 	if (!-d $dir) {
-	    print "Info: $dir missing. Doing mkdir($dir, 0755)\n";
-	    mkdir($dir, 0755) || die "Unable to create $dir: $!";
+	    warn "Info: $dir missing. Doing mkdir -p $dir\n";
+	    File::Path::make_path($dir, {user => $uid,
+					 group => $gid}) || die "Unable to create $dir: $!";
 	}
 	if ((stat($dir))[4] != $uid || (stat(_))[5] !=  $gid) {
-	    print "Warning: $dir -- setting ownership to $uid:$gid\n";
+	    warn "Warning: $dir -- setting ownership to $uid:$gid\n";
 	    chown ($uid, $gid, $dir) || die "Unable to set ownership for $dir: $!";
 	}
     }
     for my $file ("$cfg->{log_dir}/access.log", "$cfg->{log_dir}/error.log") {
 	if(!-e $file) {
-	    print "Warning: $file missing. Creating.\n";
+	    warn "Warning: $file missing. Creating.\n";
 	    open(my $tmp, '>', $file) || die "Unable to create $file: $!";
 	    close($tmp);
 	}
 	if ((stat($file))[4] != $uid || (stat(_))[5] !=  $gid) {
-	    print "Warning: $file -- setting ownership to $uid:$gid\n";
+	    warn "Warning: $file -- setting ownership to $uid:$gid\n";
 	    chown ($uid, $gid, $file) || die "Unable to set ownership for $file: $!";
 	}
     }
@@ -335,14 +464,26 @@ sub hashify {
     my ($href) = @_;
     return unless $$href;
     if ($$href =~ /^FrT;/) {
-	# New format: FreezeThaw
-	return (thaw($$href))[0];
-    } elsif ($$href =~ /. ./) {
+	# Deprecated format: FreezeThaw
+	if (Module::Load::Conditional::check_install(module => 'FreezeThaw')) {
+	    require FreezeThaw;
+	    return (FreezeThaw::thaw($$href))[0];
+	}
+	else {
+	    warn "Deprecated data serialisation format found. Requires libfreezethaw-perl to be installed\n";
+	}
+    }
+    elsif (Storable::read_magic $$href) {
+	# New format: Storable
+	return Storable::thaw($$href);
+    }
+    elsif ($$href =~ /. ./) {
     	# Old format: join
 	return {split(/ /, $$href)};
     } else {
-	return;
+	warn "Unrecognised serialisation method\n";
     }
+    return;
 }
 
 # Get filename from filehandle
@@ -358,7 +499,7 @@ sub fd_path {
     my ($fh) = @_;
 
     die 'Not a GLOB' unless ref $fh eq 'GLOB';
-    return '/dev/fd/' . $fh->fileno;
+    return '/proc/self/fd/' . $fh->fileno;
 }
 
 # Delete cached files by filehandle
@@ -419,7 +560,7 @@ sub read_header {
     if ($fh) {
 	for ($fh->getline) {
 	    last unless defined;
-	    if (/^(HTTP\/1\.[01]\s+)?\d{3}\s+/) { # Valid
+	    if (/^(?:HTTP\/1\.[01]\s+)?\d{3}\s+/) { # Valid
 		seek($fh,0,0) || die "Seek failed: $!";
 		{
 		    local $/; # Slurp
@@ -500,7 +641,7 @@ sub get_namespace {
 	while (defined(local $_ = pop @path)) {
 	    last if /^(?:pool|dists)$/;
 	}
-	return join('_', grep {!/^$/} @path);
+	return join('_', grep {length} @path);
     }
     return;
 }
@@ -564,18 +705,20 @@ sub extract_sums {
    my ($indexbase) = ($name =~ /([^\/]+_)(?:Index|(?:In)?Release)$/);
    $indexbase = '' unless $indexbase; # Empty by default (for Sources)
 
+   my %hash_length = (32 => 'md5', 40 => 'sha1', 64 => 'sha256');
    my ($skip,%data);
    while(<$raw>) {
        last if $AnyUncompressError;
        chomp;
-       # This flag prevents us bothering with the History section of diff_Index files
-       if (/^SHA1-(?:Current|History)/) {
-	   $skip = 1;
-       }
-       elsif (/^SHA1-Patches:/) {
+       if (/^SHA\d+-Patches:/) {
 	   $skip = 0;
        }
-       elsif (/^\s(\w{32}|\w{40}|\w{64})\s+(\d+)\s(\S+)$/) { # diff_Index/Release/Sources
+       elsif (/^SHA\d+-[a-zA-Z]+:/) {
+	   # This flag prevents us bothering with unnecessary sections
+	   # (History|Current|Download) of diff_Index files
+	   $skip = 1;
+       }
+       elsif (/^\s+([a-z0-9]{32,64})\s+(\d+)\s(\S+)$/) { # diff_Index/Release/Sources
 	   next if $skip;
 	   my $hexdigest=$1;
 	   my $size=$2;
@@ -586,19 +729,18 @@ sub extract_sums {
 	   if ($name =~ /Index$/) {
 	       $file.=".gz";
 	   }
-	   elsif ($name =~ /_Sources(?:\.gz|\.bz2)?$/) {
+	   elsif ($name =~ /_Sources(?:\.(?:x|g)z|\.bz2)?$/) {
 	       # Prepend namespace, if set
 	       $file = $namespace . $file;
 	   }
 	   $data{$file}{size} = $size;
-	   for (my $len = length($hexdigest)) { # Select algorithm based on hex length
-	       $len == 32 # md5
-		 && do { $data{$file}{md5}=$hexdigest; last; };
-	       $len == 40 # sha1
-		 && do { $data{$file}{sha1}=$hexdigest; last; };
-	       $len == 64 # sha256
-		 && do { $data{$file}{sha256}=$hexdigest; last; };
-	       warn "Unrecognised algorithm length: $len. Ignoring.";
+	   { # Select algorithm based on hex length
+	       my $len = length($hexdigest);
+	       if (exists $hash_length{$len}) {
+		   $data{$file}{$hash_length{$len}}=$hexdigest;
+	       } else {
+		   warn "Unrecognised algorithm length: $len. Ignoring.";
+	       }
 	   }
        }
        elsif(/^MD5sum:\s+([a-z0-9]{32})$/) { # Packages
@@ -617,9 +759,11 @@ sub extract_sums {
 	   # Prepend namespace, if set
 	   $data{file} = $namespace . $1;
        }
-
-       # diff_Index and Release files have no empty line at the end, so test eof() for them
-       if(/^$/ || ($name =~ /(?:(?:In)?Release|diff_Index)$/ && $raw->eof())) { # End of record/file
+   }
+   continue {
+       # diff_Index and Release files have no empty line at the end, so also
+       # test eof() for them
+       if(!length || $raw->eof()) { # End of record/file
 	   if (exists $data{file}) {
 	       # From Packages. Convert to hash of hashes with filename as key
 	       foreach (qw(size md5 sha1 sha256)) {
@@ -629,8 +773,8 @@ sub extract_sums {
 	       delete $data{file};
 	   }
 
-	   foreach (keys %data) {
-	       $hashref->{$_} = freeze($data{$_});
+	   while (my($key,$value) = each %data) {
+	       $hashref->{$key} = Storable::freeze($value);
 	   }
 	   undef %data; # Reset
        }
@@ -681,15 +825,15 @@ sub setup_ownership {
     my $uid=$cfg->{user};
     my $gid=$cfg->{group};
 
-    if($cfg->{chroot}) {
+    if($cfg->{_chroot}) {
 	if($uid || $gid) {
 	    # open them now, before it is too late
 	    # FIXME: reopening won't work, but the lose of file handles needs to be
 	    # made reproducible first
 	    open_log_files();
 	}
-	chroot $cfg->{chroot} || die "Unable to chroot: $1";
-	chdir $cfg->{chroot};
+	chroot $cfg->{_chroot} || die "Unable to chroot: $1";
+	chdir $cfg->{_chroot};
     }
 
     if($gid) {
@@ -720,12 +864,11 @@ sub setup_ownership {
     return;
 }
 
-# Still matches against the filename only if called with a fully qualified path
 sub is_file_type {
     my ($type,$file) = @_;
     $type .= '_files_regexp';
     die "Regexp $type not defined in config" if !exists($cfg->{$type});
-    return ((File::Spec->splitpath($file))[2] =~ $cfg->{$type});
+    return ($file =~ $cfg->{$type});
 }
 
 sub load_checksum {

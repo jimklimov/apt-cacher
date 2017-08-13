@@ -4,7 +4,7 @@
 #
 # Script to clean the apt-cacher cache.
 #
-# Copyright (C) 2007-11, Mark Hindley <mark@hindley.org.uk>
+# Copyright (C) 2007-16, Mark Hindley <mark@hindley.org.uk>
 # Copyright (C) 2005, Eduard Bloch <blade@debian.org>
 # Copyright (C) 2002-03, Jonathan Oxer <jon@debian.org>
 # Portions  (C) 2002, Jacob Lundberg <jacob@chaos2.org>
@@ -15,12 +15,12 @@ use strict;
 use warnings;
 use lib '/usr/share/apt-cacher/lib';
 
-use sigtrap qw(die normal-signals);
+use sigtrap qw(die normal-signals error-signals);
 use Cwd ();
 use Fcntl qw/:DEFAULT :flock F_SETFD/;
 use Getopt::Long qw(:config no_ignore_case);
 use Digest::SHA;
-use HTTP::Date;
+use HTTP::Date ();
 use HTTP::Response;
 use IO::Uncompress::AnyUncompress qw($AnyUncompressError);
 use IO::Compress::Bzip2;
@@ -85,6 +85,8 @@ if ($sim_mode) {
   print "Simulation mode. Just printing what would be done.\n";
 }
 
+local $SIG{CHLD} = 'IGNORE'; # Auto reap children
+
 #############################################################################
 ### configuration ###########################################################
 # Include the library for the config file parser
@@ -104,6 +106,8 @@ if ( $cfg->{clean_cache} ne 1 ) {
     printmsg("Maintenance disallowed by configuration item clean_cache\n");
     exit 0;
 }
+
+check_install(); # Before we give up rights
 
 # change uid and gid if root and another user/group configured
 if (($cfg->{user} && $cfg->{user} !~ 'root' && !$> )
@@ -137,8 +141,16 @@ sub printmsg {
 sub open_lock {
     my ($file) = @_;
 
+    my $retried;
+  TRY:
     #  Lock header LOCK_EX first to block apt-cacher from working on it
     open(my $hfh, '+<', "../headers/$file") || do {
+	if ($!{ENOENT} && !$retried && !$offline) {
+	    printmsg ("../headers/$file missing. Attempting download\n");
+	    get($file);
+	    $retried = 1;
+	    goto TRY;
+	}
 	warn ("Error: cannot open ../headers/$file for locking: $!\n");
 	return;
     };
@@ -170,7 +182,7 @@ sub get {
     if ($refresh_pid){
 	printmsg "Get $path_info\n";
 	print $fh "$_\r\n" foreach ("HEAD $path_info", 'Cache-Control: max-age=0', 'Connection: Close', '');
-	close($fh);	
+	close($fh);
     }
     else {
 	close (STDOUT);
@@ -198,21 +210,29 @@ sub pdiff {
 	printmsg "Upstream repository for $name not standard hierarchy, skipping attempting to patch\n";
 	return;
     }
-    my ($basename,$type) = ($name =~ /(^.+?)(\.(?:bz2|gz))?$/);
+
+    if ($name =~ /\.xz$/ && !eval{require IO::Compress::Xz}) {
+	printmsg "Install libio-compress-lzma-perl to enable Xz pdiff support\n";
+	return;
+    }
+
+    my ($basename,$type) = ($name =~ /(^.+?)(\.(?:bz2|(?:x|g)z))?$/);
     (my $release = $basename) =~ s/(?:main|contrib|non-free).*$/{In,}Release/;
     (my $diffindex = $basename) .= '.diff_Index';
 
     my ($release_fh, $diffin_fh);
 
     foreach my $glob_fh ([\$release, \$release_fh], [\$diffindex, \$diffin_fh]) {
-	foreach (glob(${$glob_fh->[0]})) {
-	    get($_) unless $offline;
-	    open(${$glob_fh->[1]}, '<', $_)
-	      && do {
-		  ${$glob_fh->[0]} = $_;
-		  last;
-	      }
-		|| printmsg("Failed to open $_: $!\n");
+	foreach my $file (glob(${$glob_fh->[0]})) {
+	    get($file) unless $offline;
+	    # Don't use open_lock(), it is too noisy
+	    if (open(${$glob_fh->[1]}, '<', $file)) {
+		${$glob_fh->[0]} = $file;
+		last;
+	    }
+	    else {
+		printmsg("Failed to open $file: $!\n");
+	    }
 	}
 	return unless ${$glob_fh->[1]}->opened;
 	_flock(${$glob_fh->[1]}, LOCK_SH) || die("Cannot lock ${$glob_fh->[0]}: $!");
@@ -257,7 +277,7 @@ sub pdiff {
     # Check size first
     if (-s $cfh == $name_size) {
 	printmsg ("$name matches size in $release, going on to check SHA1..\n");
-	
+
 	# Check SHA1 only if size correct
 	$digest = $sha1->addfile($cfh)->hexdigest;
 	if ($digest eq $name_sha1) {
@@ -272,11 +292,11 @@ sub pdiff {
 	printmsg ("$name size not latest, proceeding with patch\n");
     }
 
-    my $raw = IO::Uncompress::AnyUncompress->new($name)
+    my $raw = IO::Uncompress::AnyUncompress->new($cfh)
       or die "Decompression failed: $AnyUncompressError\n";
 
     open (my $tfh, "+>", undef)|| die "Unable to open temp file: $!";
-	
+
     printmsg "Reading $basename...\n";
     while (<$raw>){
 	last if $AnyUncompressError;
@@ -286,10 +306,10 @@ sub pdiff {
     close($raw);
 
     if ($AnyUncompressError) {
-	warn "$name Read failed: $AnyUncompressError. Aborting patch\n";
+	warn "$name read failed: $AnyUncompressError. Aborting patch\n";
 	return;
     }
-	
+
     $digest = $sha1->hexdigest;
     # printmsg "$basename SHA1: $digest\n";
 
@@ -309,28 +329,40 @@ sub pdiff {
 	}
     }
     seek($diffin_fh,0,0) || die "Seek failed: $!"; # rewind
-    my $curr= <$diffin_fh>; # read first line
-    chomp $curr; # remove trailing \n
-#    printmsg "$diffindex: $curr\n";
-    my ($target_sha1, $target_size) = (split (/\s+/,$curr))[1,2];
-    if ($digest eq $target_sha1) { # check this matches /SHA1/
-	printmsg "SHA1 match: $name already up to date\n";
-	_flock($diffin_fh, LOCK_UN);
-	close ($diffin_fh);
-	return 1; # success
-    }
-    else {
-	while (<$diffin_fh>) {
-	    next if (/^SHA1-History:/); # skip header
-	    last if (/^SHA1-Patches:/);# end of history
-	    push @hist, $_;
-	    next;
-	}
-	while (<$diffin_fh>) {
-	    push @patch, $_; # To EOF
-	    next;
-	}
-    }
+    my ($header, $target_sha1, $target_size);
+    while (<$diffin_fh>) {; # read first line
+			  chomp; # remove trailing \n
+			  #    printmsg "$diffindex: $_\n";
+			  # Store SHA1 only
+			  /^SHA1-Current:\s+([[:xdigit:]]+)\s+(\d+)/ && do {
+			      $target_sha1 = $1;
+			      $target_size = $2;
+			      if ($digest eq $target_sha1) { # check this matches /SHA1/
+				  printmsg "SHA1 match: $name already up to date\n";
+				  _flock($diffin_fh, LOCK_UN);
+				  close ($diffin_fh);
+				  return 1; # success
+			      }
+			      next;
+			  };
+			  /^SHA\d+-\S+:$/ && do {
+			      $header = $_;
+			      next;
+			  };
+			  /^\s+[[:xdigit:]]+\s+\d+\s+\S+/ && do {
+			      if (!defined $header) {
+				  warn "$diffindex parse error: undefined section.\n"
+			      }
+			      if ($header eq 'SHA1-History:') {
+				  push @hist, $_;
+			      }
+			      elsif ($header eq 'SHA1-Patches:') {
+				  push @patch, $_;
+			      }
+			      next;
+			  };
+		      }
+    undef $header;
     _flock($diffin_fh, LOCK_UN);
     close ($diffin_fh);
 
@@ -348,16 +380,16 @@ sub pdiff {
 	$count++;
     }
     if (!defined $diff) {
-	warn "Existing SHA1 not found in diff_Index, aborting patch\n";
+	warn "$name SHA1 not found in diff_Index, aborting patch\n";
 	return;
     }
 
     my $diffs=''; # Initialise to work around perl bug giving "Use of uninitialized value error"
-	
+
     open(my $diffs_fh, ">", \$diffs) || die "Failed to open in memory diff file: $!";
     for (@patch[$diff .. $#patch]) {
-	my ($pdiffsha1, $size, $suff) = split;
-	my $pdiff = "$basename.diff_$suff.gz";
+	my ($pdiffsha1, $size, $id) = split;
+	my $pdiff = "$basename.diff_$id.gz";
 	if (!-f $pdiff) {
 	    if (!$offline) {
 		get($pdiff);
@@ -368,16 +400,21 @@ sub pdiff {
 	    }
 	}
 	printmsg "Reading $pdiff\n";
-	my $pdfh = IO::Uncompress::AnyUncompress->new($pdiff)
-	  or die "Decompression failed: $AnyUncompressError\n";
-	while (<$pdfh>) {
-	    last if $AnyUncompressError;
-	    print $diffs_fh $_;
-	    $sha1->add($_);
+	if ((my ($pdfh, undef) = open_lock($pdiff)) == 2) {
+	    my $zpdfh = IO::Uncompress::AnyUncompress->new($pdfh)
+	      or die "Decompression failed: $AnyUncompressError\n";
+	    while (<$zpdfh>) {
+		last if $AnyUncompressError;
+		print $diffs_fh $_;
+		$sha1->add($_);
+	    }
 	}
-	close($pdfh);
+	else {
+	    die "Failed to open $pdiff for locking: $!";
+	}
+
 	if ($AnyUncompressError) {
-	    warn "$name Read failed: $AnyUncompressError. Aborting patch\n";
+	    warn "$pdiff read failed: $AnyUncompressError. Aborting patch\n";
 	    return;
 	}
 
@@ -393,15 +430,15 @@ sub pdiff {
     fcntl($tfh, F_SETFD, 0)
       or die "Can't clear close-on-exec flag on temp filehandle: $!\n";
     my $cwd = Cwd::cwd(); # Save
-    chdir '/dev/fd' or  die "Unable to change working directory: $!";
-    open(my $patchpipe, '|-', "$patchprog ".fileno($tfh)) ||  die "Unable to open pipe for patch: $!";
+    chdir '/proc/self/fd' or  die "Unable to change working directory: $!";
+    open(my $patchpipe, '|-', "$patchprog ".fileno($tfh).($verbose ? '' : ' 2>/dev/null')) ||  die "Unable to open pipe for patch: $!";
     printmsg "Patching $name with $patchprog\n";
     print $patchpipe $diffs;
     print $patchpipe "w\n"; # ed write command
     close($patchpipe);
     chdir $cwd or die "Unable to restore working directory: $!"; # Restore
-    my $rstat =($? >> 8);
-    if ($rstat) {
+    if ($? > 0) {
+	my $rstat =($? >> 8);
 	warn "Patching failed (exit code $rstat), aborting\n";
 	return;
     }
@@ -425,9 +462,11 @@ sub pdiff {
 	    seek($cfh, 0, 0) || die "Seek failed: $!";
 	    my ($z,$encoding) = ($name=~/bz2$/ ?
 				 ((IO::Compress::Bzip2->new($cfh)), "x-bzip2") :
-				 ($name=~/gz$/ ?
-				  ((IO::Compress::Gzip->new($cfh, -Level => 9)), "x-gzip") :
-				  $cfh));
+				 ($name=~/xz$/ ?
+				  ((IO::Compress::Xz->new($cfh)), "x-xz") :
+				  ($name=~/gz$/ ?
+				   ((IO::Compress::Gzip->new($cfh, -Level => 9)), "x-gzip") :
+				   $cfh)));
 
 	    while (<$tfh>) {
 		$z->print($_);
@@ -459,22 +498,17 @@ sub pdiff {
 }
 
 # Calls _db_compact to do the work and reports results
-# Arg: DB handle ref
 sub db_compact {
-    my ($dbh) = @_;
+    my $dbh = db();
+    printmsg "Waiting for CDS lock...\n";
+    my $db_lock = $dbh->cds_lock();
     printmsg "Compacting checksum database....\n";
-    while (my ($status, %results) = @{_db_compact($dbh)}) {
-	if ($status) {
-	    printmsg "db_compact failed: $status\n";
-	    last;
-	}
-	else {
-	    printmsg " Compacted ". $results{compact_pages_free} ." pages\n Freed ". $results{compact_pages_truncated} ." pages\n";
-	    if ($results{compact_pages_free} + $results{compact_pages_truncated} == 0) {
-		printmsg "Done!\n";
-		last;
-	    }
-	}
+    my ($status, %results) = @{_db_compact($dbh)};
+    if ($status) {
+	printmsg "db_compact failed: $status\n";
+    }
+    else {
+	printmsg " Compacted ". $results{compact_pages_free} ." pages\n Freed ". $results{compact_pages_truncated} ." pages\n";
     }
     return;
 }
@@ -494,6 +528,10 @@ if (@db_mode || $db_recover){
     $verbose = 1; # Just for now
 
     if ($db_recover) {
+	if (my $env=env(1)) { # No locking
+	    printmsg "Set Panic on old database environment...";
+	    $env->set_flags(BerkeleyDB->DB_PANIC_ENVIRONMENT, 1);
+	}
 	printmsg "Running database recovery...";
 	db_recover();
 	printmsg "Done!\n";
@@ -504,7 +542,7 @@ if (@db_mode || $db_recover){
   SWITCH:
     while (local $_ = shift @db_mode) {
 	/^import$/ && do {
-	    foreach (glob('*es.bz2 *es.gz *es *Release *diff_Index')) {
+	    foreach (glob('*es.bz2 *es.xz *es.gz *es *Release *diff_Index')) {
 		open(my $fh, '<', $_)|| do {
 		    warn "Failed to open $_ for import: $!";
 		    next;
@@ -515,7 +553,7 @@ if (@db_mode || $db_recover){
 	    next SWITCH;
 	};
 	/^compact$/ && do {
-	    db_compact(db());
+	    db_compact();
 	    next SWITCH;
 	};
 	/^(?:dump|search)$/ && do {
@@ -525,7 +563,7 @@ if (@db_mode || $db_recover){
 		die "No search expression given\n" if !$re;
 		die "Invalid character '$1' in search\n" if $re =~ /([^$ok_chars])/o; # sanitize
 	    }
-	    my $cursor = get_cursor(db());
+	    my $cursor = db_cursor();
 	    my ($filename,$data) = ('','');
 	    while (cursor_next($cursor, \$filename, \$data) == 0)
 	      {
@@ -543,7 +581,7 @@ if (@db_mode || $db_recover){
 	    my $re = shift @db_mode;
 	    die "No give regex to match files to delete\n" if !$re;
 	    die "Invalid character '$1' in pattern\n" if $re =~ /([^$ok_chars])/o; # sanitize
-	    my $cursor = get_cursor(db(),1);
+	    my $cursor = db_cursor(1);
 	    my ($filename,$data) = ('','');
 	    while (cursor_next($cursor, \$filename, \$data) == 0)
 	      {
@@ -554,21 +592,23 @@ if (@db_mode || $db_recover){
 	    next SWITCH;
 	};
 	/^failcheck$/ && do {
-	    printmsg 'Connecting to database....';
-	    # Just connect to the database which runs failchk()
-	    if (db(1)) { # Without locking
+	    printmsg 'Connecting to database environment....';
+	    # Just connect to the database environment which runs failchk()
+	    if (env(1)) { # Without locking
 		printmsg "Success!\n";
 	    }
 	    next SWITCH;
 	};
 	/^verify$/ && do {
-	    printmsg "Waiting for exclusive lock...";
-	    if (db_flock(LOCK_EX)){
+	    my $db=db();
+	    printmsg "Waiting for CDS lock...";
+	    if (my $db_lock = $db->cds_lock){
+		$db->db_sync() == 0 || warn "db_sync failed:  $BerkeleyDB::Error";
 		printmsg "Got it!\nVerifying database...";
-		printmsg db_verify("$cfg->{cache_dir}/sums.db", temp_env()) ? "Failed! " . db_error() . "\n" : "Passed!\n";
+		printmsg db_verify("$cfg->{cache_dir}/sums.db", $db->Env) ? "Failed! " . db_error() . "\n" : "Passed!\n";
 	    }
 	    else {
-		warn "Unable to get exclusive database lock: $!\n";
+		warn "Unable to get CDS database lock: $!\n";
 	    }
 	    next SWITCH;
 	};
@@ -596,10 +636,11 @@ if (defined $cfg->{offline_mode} && $cfg->{offline_mode}) {
 	$offline = 1;
 }
 
-use GDBM_File;
+use DB_File ();
 open(my $tmpfile, "+>", undef) or die $!;
-tie my %valid, 'GDBM_File', fd_path($tmpfile), &GDBM_NEWDB|&GDBM_FAST, oct(600) # Does a separate open
-  or die "GDBM_File tie failed: $!";
+chmod oct(600), $tmpfile unless (stat $tmpfile)[2] & oct(7777) ^ oct(600); # workaround PerlIO_tmpfile() incorrect mode in 5.22.1
+tie my %valid, 'DB_File', fd_path($tmpfile), undef, oct(600), $DB_File::DB_BTREE # Does a separate open
+  or die "DB_File tie failed: $!";
 close($tmpfile); # So we can close this
 
 ### Preparation of the package lists ########################################
@@ -610,17 +651,17 @@ if($> == 0 && !$cfg->{user} && !$force) {
     die "Running $0 as root\nand no effective user has been specified. Aborting.\nPlease set the effective user in $configfile or use --force to ignore\n";
 }
 
-# Try to ensure corresponding Packages/Sources is present for each diff_Index
-# and Release for each Packages/Sources
-{
+if (!$offline) {
+    # Try to ensure corresponding Packages/Sources is present for each diff_Index
+    # and Release for each Packages/Sources
     my %missing;
   CHECKFILE:
-    foreach (glob('*diff_Index *{Packages,Sources}{,.gz,.bz2}')) {
+    foreach (glob('*diff_Index *{Packages,Sources}{,.gz,.xz,.bz2}')) {
 	my $file = $_;
-	if (s/\.diff_Index$/{,.gz,.bz2}/) {
+	if (s/\.diff_Index$/{,.gz,.xz,.bz2}/) {
 	    printmsg "Checking for $_ for $file\n";
 	}
-	elsif (s/(?:dists_[^_]+_(?:updates_)?\K(?:[^_]+_){2})?(?:Packages|Sources)(?:\.(?:bz2|gz))?$/{In,}Release/) {
+	elsif (s/(?:dists_[^_]+_(?:updates_)?\K(?:[^_]+_){2})?(?:Packages|Sources)(?:\.(?:bz2|(?:x|g)z))?$/{In,}Release/) {
 	    printmsg "checking for $_ for $file\n";
 	}
 	foreach (glob) {
@@ -636,13 +677,13 @@ if($> == 0 && !$cfg->{user} && !$force) {
 
 
 # Initially preserve the index files
-%valid = map {$_ => 1} glob('*{Release,diff_Index} *{Packages,Sources}{,.gz,.bz2}');
+%valid = map {$_ => 1} glob('*{Release,diff_Index} *{Packages,Sources}{,.gz,.xz,.bz2}');
 
 foreach my $file (keys %valid) {
 
     # Try to patch
     my $patched;
-    if($pdiff_mode && $file =~ /(?:Packages|Sources)(?:\.(?:bz2|gz))?$/) {
+    if($pdiff_mode && $file =~ /(?:Packages|Sources)(?:\.(?:bz2|(?:x|g)z))?$/) {
 	printmsg "Attempting to update $file by patching\n";
 	($patched = pdiff($file)) || printmsg "Patching failed or not possible\n";
     }
@@ -666,78 +707,102 @@ foreach my $file (keys %valid) {
 
 }
 
+my %parsed;
 foreach my $file (keys %valid) {
 
     printmsg "Reading: $file\n";
 
-    (my ($cfh, $hfh) = open_lock($file)) == 2 || do {
-	die "Failed to open filehandles for $file. Resolve this manually. \nExiting to prevent deletion of cache contents.\n";
-    };
+    # Assume different compressed formats of the same file are identical
+    if ($file=~ /(^.+(?:Packages|Sources))(?:\.(?:bz2|(?:x|g)z))?$/) {
+	if ($parsed{$1}) {
+	    printmsg "Already read $parsed{$1}, so skipping $file\n";
+	    next;
+	}
+	else {
+	    $parsed{$1} = $file;
+	}
+    }
 
-    extract_sums($file, $cfh, \%valid) || die("Error processing $file in $cfg->{cache_dir}/packages, cleanup stopped.\nRemove the file if the repository is no longer interesting and the packages pulled from it are to be removed.\n");
+    if ((my ($cfh, undef) = open_lock($file)) == 2) {
+	extract_sums($file, $cfh, \%valid) || die("Error processing $file in $cfg->{cache_dir}/packages, cleanup stopped.\nRemove the file if the repository is no longer interesting and the packages pulled from it are to be removed.\n");
+    }
+    else {
+	die "Failed to open filehandles for $file. Resolve this manually. \nExiting to prevent deletion of cache contents.\n";
+    }
 }
+undef %parsed;
 
 printmsg "Found ".scalar (keys %valid)." valid file entries\n";
 #print join("\n",keys %valid);
 
-# Build a source package version reverse hash for changelog validation from the .dsc files
-printmsg "Building source package file/version table\n";
-my %svrhash = map {m#([-+.a-z0-9]+_(?:\d:)?[-+.~a-zA-Z0-9]+)\.dsc# && $1 => 1} keys %valid;
-
 # Remove old checksum data
 if ($cfg->{checksum}) {
 
-    my $dbh = db();
-
-    my $do_compact;
-    $dbh && do {
 	printmsg "Removing expired entries from checksum database\n";
-	
-	my $cursor = get_cursor($dbh,1);
-	my ($filename,$data)=('','');
-	while (cursor_next($cursor, \$filename, \$data) == 0)
-	  {
-	      next if defined $valid{$filename};
-	      printmsg "Deleting checksum data for $filename\n";
-	      $cursor->c_del == 0 || warn "c_del failed: $BerkeleyDB::Error" if !$sim_mode;
-	      $do_compact = 1;
-	  }
-	db_compact($dbh) if $do_compact || $pdiff_mode;
-    };
+
+	my $do_compact;
+	{ # scope $cursor
+	    my $cursor = db_cursor(1);
+	    my ($filename,$data)=('','');
+	    while (cursor_next($cursor, \$filename, \$data) == 0)
+	      {
+		  next if defined $valid{$filename};
+		  printmsg "Deleting checksum data for $filename\n";
+		  $cursor->c_del == 0 || warn "c_del failed: $BerkeleyDB::Error" if !$sim_mode;
+		  $do_compact = 1;
+	      }
+	}
+	db_compact() if $do_compact || $pdiff_mode;
 }
 
 # Clean package directory
-foreach (glob('*{,/*}')) {
-    next if -d; # Skip directories
-    if (/([-+.a-z0-9]+_(?:\d:)?[-+.~a-zA-Z0-9]+)_changelog$/ && !$svrhash{$1}) {
-	unlink $_, "../headers/$_" unless $sim_mode;
-	printmsg "Removing expired changelog: $_ and company...\n";
-	next;
-    }
+{ # Scoping block
+    # Build a source package version reverse hash for changelog validation from the .dsc files
+    printmsg "Building source package file/version table\n";
 
-    next unless is_file_type('package', $_) || is_file_type('pdiff', get_original_url($_)); # Package and pdiff files only
+    open(my $tmpfile, "+>", undef) or die $!;
+    chmod oct(600), $tmpfile unless (stat $tmpfile)[2] & oct(7777) ^ oct(600); # workaround PerlIO_tmpfile() incorrect mode in 5.22.1
+    tie my %svrhash, 'DB_File', fd_path($tmpfile), undef, oct(600),  $DB_File::DB_BTREE # Does a separate open
+      or die "DB_File tie failed: $!";
+    close($tmpfile); # So we can close this
+    m#([-+.a-z0-9]+_(?:\d:)?[-+.~a-zA-Z0-9]+)\.dsc# and $svrhash{$1} = 1 foreach keys %valid;
 
-    if(! defined($valid{$_})) {
-	unlink $_, "../headers/$_", "../private/$_.complete" unless $sim_mode;
-	printmsg "Removing file: $_ and company...\n";
-    }
-    else {
-	# Verify SHA1 checksum
-	my $target_sum = hashify(\$valid{$_})->{sha1};
-	next unless $target_sum;
-	# print "Validating SHA1 $target_sum for $_\n";
-	open(my $fh, '<', $_) || die "Unable to open file $_ to verify checksum: $!";
-	flock($fh, LOCK_EX);
-	if (is_file_type('pdiff', get_original_url($_))) { # pdiffs need decompressing
-	    $fh = IO::Uncompress::AnyUncompress->new($fh)
-	      or die "Decompression failed: $AnyUncompressError\n";
+    foreach (glob('*{,/*}')) {
+	next if -d; # Skip directories
+	if (/([-+.a-z0-9]+_(?:\d:)?[-+.~a-zA-Z0-9]+)_changelog$/ && !$svrhash{$1}) { # Changelogs
+	    unlink $_, "../headers/$_" unless $sim_mode;
+	    printmsg "Removing expired changelog: $_ and company...\n";
 	}
-	if ((my $sha1 = Digest::SHA->new(1)->addfile($fh)->hexdigest) ne $target_sum) {
-	    unlink $_, "../headers/$_", "../private/$_.complete" unless $sim_mode;
-	    printmsg "Checksum mismatch ($target_sum <=> $sha1): $_, removing\n";
+	elsif (is_file_type('installer', get_original_url($_))) { # APT/installer files
+	    # Verify
+	    printmsg "Validating $_\n";
+	    get($_,1) unless $sim_mode;
 	}
-	# No explicit LOCK_UN: it fails with IO::Uncompress::AnyUncompress, just rely on close
-	close $fh;
+	elsif (is_file_type('package', $_) or is_file_type('pdiff', get_original_url($_))) { # Package and pdiff files
+
+	    if (! defined($valid{$_})) {
+		unlink $_, "../headers/$_", "../private/$_.complete" unless $sim_mode;
+		printmsg "Removing file: $_ and company...\n";
+	    } else {
+		# Verify SHA1 checksum
+		my $target_sum = hashify(\$valid{$_})->{sha1};
+		next unless $target_sum;
+		# print "Validating SHA1 $target_sum for $_\n";
+		open(my $fh, '<', $_) || die "Unable to open file $_ to verify checksum: $!";
+		flock($fh, LOCK_EX);
+		if (is_file_type('pdiff', get_original_url($_))) { # pdiffs need decompressing
+		    $fh = IO::Uncompress::AnyUncompress->new($fh)
+		      or die "Decompression failed: $AnyUncompressError\n";
+		}
+		if ((my $sha1 = Digest::SHA->new(1)->addfile($fh)->hexdigest) ne $target_sum) {
+		    unlink $_, "../headers/$_", "../private/$_.complete" unless $sim_mode;
+		    printmsg "Checksum mismatch ($target_sum <=> $sha1): $_, removing\n";
+		}
+		# No explicit LOCK_UN: it fails with IO::Uncompress::AnyUncompress, just rely on close
+		close $fh;
+	    }
+	}
+        next;
     }
 }
 

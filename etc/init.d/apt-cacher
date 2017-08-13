@@ -15,7 +15,8 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 DESC="Apt-Cacher"
 NAME=apt-cacher
 DAEMON=/usr/sbin/$NAME
-PIDFILE=/var/run/$NAME.pid
+RUNDIR=/var/run/$NAME
+PIDFILE=$RUNDIR/$NAME.pid
 SCRIPTNAME=/etc/init.d/$NAME
 
 # Gracefully exit if the package has been removed.
@@ -40,6 +41,17 @@ d_start() {
 	    echo "$NAME."
     else
         echo "Not started (AUTOSTART not enabled in /etc/default/$NAME)";
+
+        # apt-cacher needs $RUNDIR, but is not able to create it in inetd or CGI mode
+	if test ! -d "$RUNDIR"; then
+	    mkdir -m 755 "$RUNDIR"
+	    CONFIG_FILES="/etc/$NAME/$NAME.conf $(run-parts --list /etc/$NAME/conf.d)"
+	    RUN_AS_USER=$(sed -n 's/^\s*user\s*=//p' $CONFIG_FILES  | tail -1 | tr -d '[:blank:]')
+	    RUN_AS_GROUP=$(sed -n 's/^\s*group\s*=//p' $CONFIG_FILES | tail -1 | tr -d '[:blank:]')
+	    [ "$RUN_AS_USER" ] && chown $RUN_AS_USER "$RUNDIR"
+	    [ "$RUN_AS_GROUP" ] && chgrp $RUN_AS_GROUP "$RUNDIR"
+	fi
+
     fi
 }
 
@@ -73,11 +85,10 @@ case "$1" in
   force-reload|reload)
 	echo -n "Reloading configuration of $DESC: "
 	test -f $PIDFILE && pid=`cat $PIDFILE`
-	echo -n "$NAME"
 	if test -z "$pid" ; then
-	    echo ", not running"
+	    echo "$NAME not running."
 	else
-	    kill -HUP $pid
+	    kill -HUP $pid && echo "done!."
 	fi
 	;;
   status)

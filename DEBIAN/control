@@ -1,0 +1,36 @@
+Package: apt-cacher
+Version: 1.7.15
+Architecture: all
+Maintainer: Mark Hindley <mark@hindley.org.uk>
+Installed-Size: 287
+Depends: perl:any, debconf (>= 0.5) | debconf-2.0, libwww-curl-perl (>= 4.00), libwww-perl, ed, libio-interface-perl, libfilesys-df-perl, libnetaddr-ip-perl, lsb-base (>= 3.2-14), update-inetd, libsys-syscall-perl, ucf (>= 0.28), libipc-shareable-perl, libdpkg-perl
+Recommends: libberkeleydb-perl (>= 0.34), libio-compress-lzma-perl
+Suggests: libio-socket-inet6-perl, libfreezethaw-perl
+Section: net
+Priority: optional
+Description: Caching proxy server for Debian/Ubuntu software repositories
+ Apt-cacher performs caching of files requested by apt-get (or other APT clients
+ such as aptitude or synaptic). Apt-cacher can also proxy Debian Bugs SOAP
+ requests for apt-listbugs. It is most useful for local area networks with
+ limited network bandwidth or to reduce multiple large downloads.
+ .
+ When a file or package is requested, apt-cacher checks whether it already has
+ the requested version, in which case it fulfils the request immediately.  If
+ not, it downloads the package while streaming it to the client at the same
+ time. A local copy is then kept for any subsequent requests.
+ .
+ Apt-cacher has been optimized for best utilization of network bandwidth and is
+ efficient even on slow or low-memory servers. Multiple ways of installation
+ are possible: as a stand-alone proxy, as a daemon executed by inetd or as
+ a CGI program (deprecated). Client machines are configured by changing APT's
+ proxy configuration or modification of access URLs in sources.list.
+ .
+ The package includes utilities to clean the cache (removing obsolete package
+ files), generate usage reports and import existing package files.  Optional
+ features include a file checksum verification framework, IPv6 support, FTP and
+ HTTPS (proxying only) support as well as the simultaneous caching of different
+ repositories (e.g Debian and Ubuntu).
+ .
+ Apt-cacher can be used as a replacement for apt-proxy, with no need to modify
+ client's /etc/apt/sources.list files (and even reusing its config and cached
+ data), or as an alternative to approx.

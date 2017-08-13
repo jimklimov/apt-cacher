@@ -7,11 +7,14 @@
 use strict;
 use warnings;
 
-use BerkeleyDB;
+# Handle signals so that END blocks get executed
+use sigtrap qw(handler sig_handler normal-signals error-signals);
+
+use BerkeleyDB ();
 use Digest::SHA;
 use Digest::MD5;
 use IO::Uncompress::AnyUncompress qw($AnyUncompressError);
-use Fcntl qw(:DEFAULT :flock);
+use Fcntl qw(O_RDONLY O_CREAT :flock);
 use IPC::SysV qw(IPC_CREAT IPC_EXCL SEM_UNDO);
 use IPC::Semaphore;
 
@@ -28,17 +31,10 @@ sub sig_handler {
     exit 1;
 }
 
-# Need to handle non-catastrophic signals so that END blocks get executed
-local $SIG{$_} = \&sig_handler foreach qw{INT TERM PIPE QUIT HUP SEGV};
-
-# Returns a DB handle
-#
-# Note: BerkeleyDB is not reentrant/fork safe, so avoid forking or calling this
-# function time whilst a previously returned handle is still in scope.
-sub db {
+sub env {
     my ($nolock) = @_;
-    my $dbfile="$cfg->{cache_dir}/sums.db";
-    debug_message('Init checksum database') if defined &debug_message && $cfg->{debug};
+
+    debug_message('Init checksum database environment') if defined &debug_message && $cfg->{debug};
 
     # Serialise enviroment handling
     my $envlock;
@@ -50,56 +46,66 @@ sub db {
 
     my @envargs = (
 		   -Home   => $cfg->{cache_dir},
-		   -Flags => DB_CREATE | DB_INIT_MPOOL | DB_INIT_CDB,
+		   -Flags => BerkeleyDB->DB_CREATE | BerkeleyDB->DB_INIT_MPOOL | BerkeleyDB->DB_INIT_CDB,
 		   -ThreadCount => 64
 		  );
 
     my $logfile;
-    push (@envargs, (-ErrFile => $logfile, -ErrPrefix => "[$$]")) if open($logfile, '>>', "$cfg->{log_dir}/db.log");
+    push (@envargs, (-ErrFile => $logfile, -ErrPrefix => localtime . " [$$]")) if open($logfile, '>>', "$cfg->{log_dir}/db.log");
     debug_message('Create DB environment') if defined &debug_message && $cfg->{debug};
     my $env;
-    eval {
-	local $SIG{__DIE__} = 'IGNORE'; # Prevent log verbosity
-	local $SIG{ALRM} = sub { die "timeout\n" }; # NB: \n required
-	alarm $cfg->{request_timeout};
-	$env = BerkeleyDB::Env->new(@envargs);
-	alarm 0;
-    };
-    if ($@) {
-	die unless $@ eq "timeout\n"; # propagate unexpected errors
-    }
-    unless ($env) {
-	warn "Failed to create DB environment: $BerkeleyDB::Error. Attempting recovery...\n";
-	db_recover();
-	$env = BerkeleyDB::Env->new(@envargs);
-    }
+    $env=BerkeleyDB::Env->new(@envargs)
+      or $nolock # Only if we have locked
+	or do {
+	    warn "Failed to create DB environment: $BerkeleyDB::Error. Attempting recovery...\n";
+	    db_recover();
+	    $env = BerkeleyDB::Env->new(@envargs);
+	} ;
     die "Unable to create DB environment: $BerkeleyDB::Error\n" unless $env;
 
-    $env->set_isalive;
-    failchk($env);
+    # Set environment lock timeout
+    $env->set_timeout($cfg->{request_timeout}*10**6, BerkeleyDB->DB_SET_LOCK_TIMEOUT); # in µs
 
-    # Take shared lock. This protects verify which requests LOCK_EX
-    db_flock(LOCK_SH)|| die "Shared lock failed: $!\n";
+    $env->set_isalive;
+    if (failchk($env) == BerkeleyDB->DB_RUNRECOVERY) {
+	# Notify all processes using the Environment
+	$env->set_flags(BerkeleyDB->DB_PANIC_ENVIRONMENT, 1);
+	die "DB environment requires recovery but not holding lock. Exiting.\n" if $nolock;
+	warn "Failed thread detected. Running database recovery.\n";
+	db_recover();
+	$env = BerkeleyDB::Env->new(@envargs)
+	  or die "Unable to recreate DB environment: $BerkeleyDB::Error\n";
+    }
 
     unless ($nolock) {
 	_flock($envlock, LOCK_UN)||die "Unable to unlock DB environment: $!\n";
         close($envlock);
     }
 
+    return $env;
+}
+
+# Returns a DB handle
+#
+# Note: BerkeleyDB is not reentrant/fork safe, so avoid forking or calling this
+# function whilst a previously returned handle is still in scope.
+sub db {
+    my $dbfile="$cfg->{cache_dir}/sums.db";
+    debug_message('Init checksum database') if defined &debug_message && $cfg->{debug};
+
     debug_message('Open database') if defined &debug_message && $cfg->{debug};
     my $dbh = BerkeleyDB::Btree->new(-Filename => $dbfile,
-				     -Flags => DB_CREATE,
-				     -Env => $env)
+				     -Flags => BerkeleyDB->DB_CREATE,
+				     -Env => env())
       or die "Unable to open DB file, $dbfile $BerkeleyDB::Error\n";
 
     return $dbh;
 }
 
-# Arg is DB handle
-# Arg is not undef for DB_WRITECURSOR
-sub get_cursor {
-    my ($dbh,$write)=@_;
-    my $cursor = $dbh->db_cursor($write?DB_WRITECURSOR:undef) or die $BerkeleyDB::Error;
+# Arg is not undef for BerkeleyDB->DB_WRITECURSOR
+sub db_cursor {
+    my ($write)=@_;
+    my $cursor = db()->db_cursor($write?BerkeleyDB->DB_WRITECURSOR:undef) or die $BerkeleyDB::Error;
     return $cursor;
 }
 
@@ -108,75 +114,38 @@ sub get_cursor {
 # Arg is data reference
 sub cursor_next {
     my ($cursor,$keyref,$dataref) = @_;
-    return $cursor->c_get($$keyref, $$dataref, DB_NEXT)
+    return $cursor->c_get($$keyref, $$dataref, BerkeleyDB->DB_NEXT)
 }
 
 # Arg is the environment object
 sub failchk {
     my ($e) = @_;
-#    warn "$$ failchk on $e\n";
-    if ($e->failchk == DB_RUNRECOVERY) {
-	warn "Failed thread detected. Running database recovery\n";
-	db_recover();
+    # Sometimes failchk is returning EINVAL (22), so just loop until we get no
+    # error or DB_RUNRECOVERY
+    while (my $status = $e->failchk) {
+	warn "failchk returned $status\n";
+	return $status if $status == BerkeleyDB->DB_RUNRECOVERY;
     }
-    return;
-}
-
-# Arg is flock flags
-my $dblock;
-sub db_flock {
-    my ($flags) = @_;
-    if (!$dblock){
-	sysopen($dblock, "$cfg->{cache_dir}/private/dblock", O_RDONLY|O_CREAT) ||
-	  die "Unable to open lockfile: $!\n";
-    }
-    return _flock($dblock, $flags);
+    return 0;
 }
 
 sub db_recover {
     env_remove();
-    my @envargs = (
-		   -Home   => $cfg->{cache_dir},
-		   -Flags  => DB_CREATE | DB_INIT_LOG |
-		   DB_INIT_MPOOL | DB_INIT_TXN |
-		   DB_RECOVER | DB_PRIVATE | DB_USE_ENVIRON
-		  );
 
-    # Avoid leaving DB log on filesystem if possible
-    if ($BerkeleyDB::db_version <= 4.6) {
-	# Cannot use for db4.7. Requires log_set_config() to be called before Env open
-	eval {push(@envargs, (-SetFlags => DB_LOG_INMEMORY))};
+    # Verify
+    my $dbfile = "$cfg->{cache_dir}/sums.db";
+    if (db_verify($dbfile) == 0) {
+	warn "Database verification passed.\n";
     }
-    elsif ($BerkeleyDB::VERSION >= 0.40) {
-	eval {push(@envargs, (-LogConfig => DB_LOG_IN_MEMORY))}
+    else {
+	warn 'Database verification failed: ' . db_error() . "\n Moving $dbfile out of the way.\n";
+	rename $dbfile, "$dbfile.corrupt";
     }
-
-    my $logfile;
-    push(@envargs, (-ErrFile => $logfile)) if open($logfile, '>>', "$cfg->{log_dir}/db.log");
-    my $renv = BerkeleyDB::Env->new(@envargs)
-      or die "Unable to create recovery environment: $BerkeleyDB::Error\n";
-    unlink "$cfg->{cache_dir}/private/dblock";
-    return defined $renv;
+    return;
 }
 
 sub env_remove {
     return unlink <$$cfg{cache_dir}/__db.*>; # Remove environment
-}
-
-sub temp_env {
-    # From db_verify.c
-    # Return an unlocked environment
-    # First try to attach to an existing MPOOL
-    my $tempenv;
-    $tempenv = BerkeleyDB::Env->new(-Home   => $cfg->{cache_dir},
-				    -Flags => DB_INIT_MPOOL | DB_USE_ENVIRON)
-      or
-	# Else create a private region
-	$tempenv = BerkeleyDB::Env->new(-Home   => $cfg->{cache_dir},
-					-Flags => DB_CREATE | DB_INIT_MPOOL |
-					DB_USE_ENVIRON | DB_PRIVATE)
-	  or die "Unable to create temporary DB environment: $BerkeleyDB::Error\n";
-    return $tempenv;
 }
 
 sub db_error {
@@ -195,17 +164,10 @@ sub _db_compact {
     my %hash;
     my $status;
     return (\'DB not initialised in _db_compact', undef) unless $dbh;
-  SWITCH:
-    for ($dbh->type) {
-	/1/ && do { # Btree
-	    $status = $dbh->compact(undef,undef,\%hash,DB_FREE_SPACE);
-	    last SWITCH;
-	};
-	/2/ && do { # Hash
-	    $status = $dbh->compact(undef,undef,\%hash,DB_FREELIST_ONLY);
-	    last SWITCH;
-	};
-    }
+    $hash{compact_timeout} = 10; # microseconds
+    my $mode = ($BerkeleyDB::db_version >= 5 || $dbh->type == BerkeleyDB->DB_BTREE) ? BerkeleyDB->DB_FREE_SPACE : BerkeleyDB->DB_FREELIST_ONLY;
+    $status = $dbh->compact(undef,undef,\%hash,$mode);
+
     return [$status, %hash];
 }
 
@@ -232,7 +194,6 @@ sub get_existing_sem {
 # arg: name with optional filehandle to be scanned and added to DB
 sub import_sums {
     my ($name, $fh) = @_;
-    my %temp;
     my $sem;
     return unless $cfg->{checksum};
     if ($cfg->{concurrent_import_limit}) {
@@ -245,12 +206,15 @@ sub import_sums {
 	}
     }
 
-    if (extract_sums($name, $fh, \%temp)) {
-	my $dbh = db();
-	while (my ($filename,$data) = each %temp){
-	    $dbh->db_put($filename,$data) == 0 || warn "db_put $filename, $data failed with $BerkeleyDB::Error" ;
-	}
-    }
+    tie my %db, "BerkeleyDB::Btree",
+      -Filename => "$cfg->{cache_dir}/sums.db",
+      -Env => env(),
+      -Flags => BerkeleyDB->DB_CREATE
+      or die "Failed to tie hash to database: $BerkeleyDB::Error\n";
+
+    extract_sums($name, $fh, \%db);
+
+    untie %db;
 
     # Release semaphore
     $sem->op(0, 1, SEM_UNDO) if $sem;

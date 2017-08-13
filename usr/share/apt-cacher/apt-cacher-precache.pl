@@ -33,7 +33,7 @@ my %options = (
     "c|cfgfile=s"        => \$configfile,
     "l|list-dir=s"        => \$uselists
 );
- 
+
 
 &help unless ( GetOptions(%options));
 &help if ($help);
@@ -75,9 +75,10 @@ NOTE: the options may change in the future.
 You can feed existing package lists or old apt-cacher logs into the selection
 algorithm by using the -l option above. If the version is omited (eg. for lists
 created with \"dpkg --get-selections\" then the packages may be redownloaded).
-To avoid this, use following one-liner to fake a list with version infos:
+To avoid this, install libdpkg-perl and use following one-liner to fake a list
+with version infos:
 
-dpkg -l | perl -ne 'if(/^(i.|.i)\\s+(\\S+)\\s+(\\S+)/) { print \"\$2_\$3_i386.deb\\n\$2_\$3_all.deb\\n\"}'
+dpkg -l | perl -MDpkg::Arch -ne 'if(/^(i.|.i)\\s+(\\S+)\\s+(\\S+)/) { print \"\$2_\$3_\", Dpkg::Arch::get_host_arch, \".deb\\n\$2_\$3_all.deb\\n\"}'
 
 "; exit 1;};
 
@@ -146,7 +147,7 @@ PKGITER: for my $pgz (glob('*Packages*')) {
          next PKGITER;
       }
    }
-   
+
    my $pgz_path_info=$pgz;
    $pgz_path_info =~ s!_!/!g;
    my $root_path_info = $pgz_path_info;
@@ -156,7 +157,7 @@ PKGITER: for my $pgz (glob('*Packages*')) {
    my ($cat, $listpipe);
    $_=$pgz;
    $cat = (/bz2$/ ? "bzcat" : (/gz$/ ? "zcat" : "cat"));
-   
+
    &get($pgz_path_info, $_);
 
    print "I: processing $_\n" if !$quiet;
@@ -173,7 +174,7 @@ PKGITER: for my $pgz (glob('*Packages*')) {
             my $filename=$_;
             s!_.*!!g;
             my $pkgname=$_;
-            
+
             if(length($priofilter)) {
                if(!-e $filename && $prio=~/$priofilter/ ) {
                   &get($deb_path_info, $filename);
