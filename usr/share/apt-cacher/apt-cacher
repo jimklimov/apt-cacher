@@ -32,7 +32,8 @@ use strict;
 use warnings;
 use lib '/usr/share/apt-cacher/lib';
 
-use Fcntl qw(O_RDWR O_CREAT :flock);
+use Fcntl qw(O_RDWR O_CREAT O_RDONLY :flock);
+use FreezeThaw ();
 use Storable ();
 use IO::Socket::INET;
 use IO::Select;
@@ -56,7 +57,7 @@ use Hash::Util;
 require('apt-cacher.pl');
 
 # Set some defaults
-my $version='1.7.15';
+my $version='1.7.15.1';
 
 my $mode; # cgi|inetd|undef
 
@@ -732,8 +733,9 @@ sub handle_connection {
 	# Open/create cached file
 	for (my $cached_file = "$cfg->{cache_dir}/packages/$cache->{name}") {
 	    unlink $cached_file if $cache->{status} && $cache->{status} eq 'NOCACHE'; # Ensure new file for Cache-Control: no-cache
-	    sysopen($cache->{content}, $cached_file, O_RDWR|O_CREAT)
-	      || die "Failed to open/create $cached_file for return: $!";
+	    unlink $cached_file.".tmp";
+	    sysopen($cache->{content}, $cached_file . ".tmp", O_RDWR|O_CREAT)
+	      || die "Failed to open/create $cached_file.tmp for return: $!";
 	}
 
 	# Existing response
@@ -900,6 +902,111 @@ sub handle_connection {
 		    $cfg->{debug} && debug_message($cache->{status});
 		}
 		$response = fetch_store(upstream_request($request), $cache);
+	    }
+	}
+
+	# rename the .tmp file over the final filename
+	{
+	    my $fhT = $cache->{content};
+	    my $fhO;
+	    my $num=0;
+	    my $cached_file_tmp = filename_fh($cache->{content});
+	    my $cached_file = "$cfg->{cache_dir}/packages/$cache->{name}";
+	    # just inspect contents - that it has no HTTP ERRORS inside
+	    sysseek($fhT,0,0);
+	    seek($fhT,0,0);
+	    while (<$fhT>) {
+		chomp;
+		if ( /<\/?html>/i || /<\/?head>/i ) {
+		    $cfg->{debug} && debug_message("Unexpected HTML markup detected in file $cached_file_tmp contents, may be a mid-way proxy error");
+		    $cache->{status} = 'MISS'; # Force download
+		    unlink $cached_file_tmp;
+		    $cached_file_tmp = "";
+		    close($fhT);
+#		    die("BAD DOWNLOAD in $cached_file_tmp");
+		    # Fall through to old cached file, if any?..
+		    sysopen($cache->{content}, $cached_file, O_RDWR|O_CREAT)
+			|| die "Failed to re-open/create $cached_file for return: $!";
+		}
+	    }
+
+	    if ( $cached_file_tmp ne "" ) {
+		if (1==1) {
+		    # Just call external diff
+		    $cfg->{debug} && debug_message("Comparing whether $cached_file_tmp is different from existing $cached_file");
+		    system ("diff", "$cached_file_tmp", "$cached_file");
+		    if ($? == 0) {
+			$cfg->{debug} && debug_message("Existing file $cached_file has same content as newly fetched $cached_file_tmp, keeping old");
+			$cache->{status} = 'HIT';
+			unlink $cached_file_tmp;
+			$cached_file_tmp = "";
+			# Fall through to old cached file
+			sysopen($cache->{content}, $cached_file, O_RDWR|O_CREAT)
+			    || die "Failed to re-open/create $cached_file for return: $!";
+		    } else { # diff
+			# Files are different
+			$cfg->{debug} && debug_message("$cached_file does not exist or has different content from newly fetched $cached_file_tmp, replacing");
+			# Fall through to unlink+rename
+		    }
+		} else { # else for hack-flag
+		# Try to diff inside perl
+		if (sysopen($fhO, $cached_file, O_RDONLY)) {
+#		    if ( -s $cached_file == -s $cached_file_tmp) {
+			$cfg->{debug} && debug_message("Comparing whether $cached_file_tmp is different from existing $cached_file");
+			binmode $fhT or die "Can't binmode $cached_file_tmp";
+			binmode $fhO or die "Can't binmode $cached_file";
+			sysseek($fhT,0,0);
+			seek($fhT,0,0);
+			sysseek($fhO,0,0);
+			seek($fhO,0,0);
+			local $/ = \ 4096;
+			while (<$fhT> eq <$fhO>) {
+			    $num++;
+			}
+			$cfg->{debug} && debug_message("Compared $num iterations");
+			if ( eof $fhT and eof $fhO ) {
+			    # Both files ended at once and no differences found
+			    $cfg->{debug} && debug_message("Existing file $cached_file has same content as newly fetched $cached_file_tmp, keeping old");
+			    $cache->{status} = 'HIT';
+			    unlink $cached_file_tmp;
+			    $cached_file_tmp = "";
+			    close($fhT);
+			    close($fhO);
+			    # Fall through to old cached file
+			    sysopen($cache->{content}, $cached_file, O_RDWR|O_CREAT)
+				|| die "Failed to re-open/create $cached_file for return: $!";
+			} else {
+			    # Files are different
+			    if ($cfg->{debug}) {
+				debug_message("Existing file $cached_file has different content from newly fetched $cached_file_tmp, replacing");
+				debug_message("  eofT: " .eof $fhT);
+				debug_message("  eofO: " .eof $fhO);
+				debug_message("  defT: " .defined(<$fhT>) );
+				debug_message("  defO: " .defined(<$fhO>) );
+			    }
+			    close($fhO);
+			    # Fall through to unlink+rename
+			}
+#		    } else {
+#			# Files are different in size
+#			if ($cfg->{debug}) {
+#			    debug_message("Existing file $cached_file has different size from newly fetched $cached_file_tmp, replacing");
+#			    debug_message("  szT: ", (-s $cached_file_tmp));
+#			    debug_message("  szO: ", (-s $cached_file));
+#			}
+#			close($fhO);
+#			# Fall through to unlink+rename
+#		    }
+		} else {
+		    $cfg->{debug} && debug_message("No existing $cached_file located, replacing with newly fetched $cached_file_tmp");
+		}
+		}
+	    }
+
+	    if ( $cached_file_tmp ne "" ) {
+		$cfg->{debug} && debug_message("Renaming good $cached_file_tmp into $cached_file");
+		unlink $cached_file;
+		rename $cached_file_tmp, $cached_file || debug_message("Failed to rename $cached_file_tmp into $cached_file");
 	    }
 	}
 
@@ -1845,6 +1952,20 @@ sub libcurl {
 		my $cached_file = filename_fh($cache->{content});
 		$cfg->{debug} && debug_message('stored '.$request->uri." as $cached_file");
 		_flock($cache->{content}, LOCK_UN);
+
+		# just inspect contents - that it has no HTTP ERRORS inside
+		my $fh = $cache->{content};
+		sysseek($fh,0,0);
+		seek($fh,0,0);
+		while (<$fh>) {
+		    chomp;
+		    if ( /<\/?html>/i || /<\/?head>/i ) {
+			$cfg->{debug} && debug_message("Unexpected HTML markup detected in file $cached_file contents, may be a mid-way proxy error");
+			$cfg->{debug} && debug_message('Incomplete, no fetcher running, downloading');
+			$cache->{status} = 'MISS'; # Force removal and download
+		    }
+		}
+
 		if ($cfg->{checksum} && is_file_type('checksum', $curl_request->uri->path)) {
 		    # index file with checksums? Get checksums
 		    $cfg->{debug} && debug_message("Reading checksums from $cached_file");
