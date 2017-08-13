@@ -1,0 +1,92 @@
+#! /bin/sh
+#
+
+### BEGIN INIT INFO
+# Provides:          apt-cacher
+# Required-Start:    $remote_fs
+# Required-Stop:     $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: apt-cacher package caching proxy daemon 
+# Description:       The apt-cacher service is used to cache packages for a system or LAN
+### END INIT INFO
+
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+DESC="Apt-Cacher"
+NAME=apt-cacher
+DAEMON=/usr/sbin/$NAME
+PIDFILE=/var/run/$NAME.pid
+SCRIPTNAME=/etc/init.d/$NAME
+
+# Gracefully exit if the package has been removed.
+test -x $DAEMON || exit 0
+
+# Read config file if it is present.
+if [ -r /etc/default/$NAME ]
+then
+	. /etc/default/$NAME
+fi
+
+. /lib/lsb/init-functions
+
+#
+#	Function that starts the daemon/service.
+#
+d_start() {
+
+    if test "$AUTOSTART" = 1 ; then
+        start-stop-daemon --start --quiet  \
+	    --exec $DAEMON -- -R 3 -d -p $PIDFILE $EXTRAOPT && \
+	    echo "$NAME."
+    else
+        echo "Not started (AUTOSTART not enabled in /etc/default/$NAME)";
+    fi
+}
+
+#
+#	Function that stops the daemon/service.
+#
+d_stop() {
+	start-stop-daemon --stop --quiet --retry=TERM/10/KILL/5 --pidfile $PIDFILE \
+		--name $NAME
+
+	# Also stop any running libcurl backend
+	/usr/share/apt-cacher/libcurl.pl EXIT
+}
+
+case "$1" in
+  start)
+	echo -n "Starting $DESC: "
+	d_start
+	;;
+  stop)
+	echo -n "Stopping $DESC: "
+	d_stop
+	echo "$NAME."
+	;;
+  restart)
+	echo -n "Restarting $DESC: "
+	d_stop
+	sleep 1
+	d_start
+	;;
+  force-reload|reload)
+	echo -n "Reloading configuration of $DESC: "
+	test -f $PIDFILE && pid=`cat $PIDFILE`
+	echo -n "$NAME"
+	if test -z "$pid" ; then
+	    echo ", not running"
+	else
+	    kill -HUP $pid
+	fi
+	;;
+  status)
+	status_of_proc "$DAEMON" "$NAME" && exit 0 || exit $?
+	;;
+  *)
+	echo "Usage: $SCRIPTNAME {start|stop|restart|reload|force-reload|status}" >&2
+	exit 1
+	;;
+esac
+
+exit 0

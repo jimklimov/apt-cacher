@@ -1,0 +1,2244 @@
+#!/usr/bin/perl
+
+# ----------------------------------------------------------------------------
+
+=head1 NAME
+
+apt-cacher
+
+=head1 DESCRIPTION
+
+Caching HTTP proxy optimized for use with APT
+
+=head1 DOCUMENTATION
+
+Detailed, full usage and configuration information for both servers and clients
+is contained in the L<apt-cacher(8)> manpage. There are additional notes in
+F</usr/share/doc/apt-cacher/README.Debian.gz>. The default server configuration
+file, F</etc/apt-cacher/apt-cacher.conf>, also contains further server
+configuration examples.
+
+=head1 COPYRIGHT
+
+ Copyright (C) 2005 Eduard Bloch <blade@debian.org>
+ Copyright (C) 2007-2011 Mark Hindley <mark@hindley.org.uk>
+ Distributed under the terms of the GNU Public Licence (GPL).
+
+=cut
+
+# ----------------------------------------------------------------------------
+
+use strict;
+use warnings;
+use lib '/usr/share/apt-cacher/lib';
+
+use Fcntl qw(:DEFAULT :flock);
+use WWW::Curl::Easy;
+use WWW::Curl::Multi;
+use WWW::Curl::Share;
+use FreezeThaw qw(freeze thaw);
+use IO::Socket::INET;
+use IO::Select;
+use IO::Interface::Simple;
+use HTTP::Request;
+use HTTP::Response;
+use HTTP::Date;
+use Time::Piece;
+use Sys::Hostname ();
+use Filesys::Df;
+use Time::HiRes qw(sleep);
+use NetAddr::IP;
+use NetAddr::IP::Util;
+use List::Util;
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Sys::Syscall;
+use POSIX ();
+use Hash::Util;
+
+# Include the library for the config file parser
+require('apt-cacher.pl');
+
+# Set some defaults
+my $version="1.7.6";
+
+my $mode; # cgi|inetd|undef
+
+# Needs to be global for setup_ownership()
+our $cfg;
+
+# Data shared between functions
+my ($aclog_fh, $erlog_fh);
+my ($con, $source);
+my $listeners;
+
+# Subroutines
+
+sub setup {
+    my $configfile_default = '/etc/apt-cacher/apt-cacher.conf';
+    my $configfile = $configfile_default;
+    my $pidfile;
+    my $chroot;
+    my $retnum;
+    my $fork;
+
+    my @extraconfig;
+
+    if($ENV{CGI_MODE}) {
+	# yahoo, back to the roots, CGI mode
+	$mode='cgi';
+    }
+    else {
+	local @ARGV = @ARGV; # Use a copy so @ARGV not destroyed
+	my $help;
+	my $inetd;
+	my $show_version;
+
+	my %options = (
+		       'h|help' => \$help,
+		       'c|cfg|conf=s' => \$configfile,
+		       'i|inetd' => \$inetd,
+		       'r|chroot=s' => \$chroot,
+		       'd|daemon' => \$fork,
+		       'p|pidfile=s' => \$pidfile,
+		       't|try|tries|R|retry|retries=i' => \$retnum,
+		       'v|version' => \$show_version
+		      );
+
+	if (!GetOptions(%options) || $help) {
+	    die <<EOM
+Usage: $0 [-h|--help] [-c|--cfg|--conf <configfile>]
+ [-i|--inetd] [-d|--daemon] [-r|--chroot <directory>] [-p|--pidfile] <pidfile>]
+ [-t|--tries|-R|--retry <retries>] [-v|--version] [<option>=<value>]...
+
+Options:
+ -h		 Show this usage.
+ -c <configfile> Custom config file (default: $configfile_default).
+ -i		 Inetd mode, STDIN and STDOUT are used for input and output.
+ -d		 Fork and run as a background daemon.
+ -t|-R <retries> Number of times to attempt bind to daemon port.
+
+Root only options:
+ -r <directory> Path to chroot to after reading the config and opening the log
+		files. Cache directory setting is relative to the new root.
+ -p <pidfile>   Write the server process ID into this file
+ -v		Show version and exit.
+
+ Configuration option(s) which override configuration file settings
+  can also appear at the end of the command line, eg. daemon_port=9999
+EOM
+	}
+
+	die "$0: Version $version\n" if $show_version;
+
+	# Sanity check
+	die "Chroot directory  $chroot invalid: $!" if $chroot && !-d $chroot;
+
+	# Handle INETD mode
+	$mode = 'inetd' if $inetd;
+
+	# Read command line configuration overrides
+	while(@ARGV) {
+	    my $arg = shift(@ARGV);
+	    if($arg =~ /^([a-z_6]{4,})=(.+)$/) { # Shortest configuration option is 4 charachters
+		push(@extraconfig, $1, $2);
+	    }
+	    else {
+		die "Unknown/invalid parameter $arg\n";
+	    }
+	}
+    }
+
+    eval {
+	$cfg = read_config($configfile);
+    };
+
+    # not sure what to do if we can't read the config file...
+    die "Could not read configuration file '$configfile': $@" if $@;
+
+    # Now set some things from the command line
+    $cfg->{pidfile} = $pidfile if $pidfile;
+    $cfg->{fork} = $fork if $fork;
+    $cfg->{retry} = $retnum if $retnum;
+    $cfg->{chroot} = $chroot if $chroot;
+
+    # override config values with the user-specified parameters
+    while(@extraconfig) {
+	my $k=shift(@extraconfig);
+	my $v=shift(@extraconfig);
+	if ($k =~ /^_/) {
+	    info_message("Can't set private configuration option $k. Ignoring");
+	    next;
+	}
+	$cfg->{$k}=$v;
+    }
+
+    # checksum
+    load_checksum();
+
+    # setup private config
+    private_config();
+
+    # Ensure config is sane and filesystem is present and readable
+    check_install();
+    # Die if it still failed
+    die "$0: No $cfg->{cache_dir}/private directory!\n" if (!-d "$cfg->{cache_dir}/private");
+
+    # Set default path for socket
+    $cfg->{libcurl_socket} = "$cfg->{cache_dir}/libcurl.socket" unless $cfg->{libcurl_socket};
+    return;
+}
+
+sub clean_exit {
+    $cfg->{debug} && debug_message('Clean up before exiting.');
+
+    # close connections, kill children
+    $con->close if $con;
+    if ($listeners) {
+        for ($listeners->handles) {$_->shutdown(2)};
+	if(getpgrp == $$) { # We are process group leader
+	    $cfg->{debug} && debug_message('Killing entire process group');
+	    local $SIG{TERM} = 'IGNORE';
+	    kill(-15, $$);
+	}
+    }
+    exit(0);
+}
+
+sub reload_config {
+    info_message('Got SIGHUP, reloading config');
+    setup();
+    return;
+}
+
+sub toggle_debug {
+    $cfg->{debug} = !$cfg->{debug};
+    info_message('Got SIGUSR1, '.($cfg->{debug} ? 'en':'dis').'abling debug output');
+    return;
+}
+
+sub clean_uri {
+    my ($uri) = @_;
+	
+    if (ref $uri !~ /^URI::/) {
+	warn ('Not a URI');
+	return;
+    }
+
+    for ($uri->opaque) {
+	# Decode embedded ascii codes in URL
+	s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg;
+	$uri->opaque($_);
+    }
+
+    # remove empty segments
+    my @path = grep {!/^$/} $uri->path_segments;
+    push(@path, '') if !($uri->path_segments)[-1]; # Preserve terminator
+
+    # remove CGI specific junk at the beginning
+    shift @path if ($path[0] && $path[0] =~ '^apt-cacher\??$');
+
+    unshift(@path, ''); # Insist on absolute path
+
+    $uri->path_segments(@path);
+
+    return;
+}
+
+sub new_filename {
+    my ($uri) = @_;
+    my $ret;
+
+    if ($cfg->{reverse_path_map}) {
+	# If requested URI is a target of path_map, store the file under the
+	# path_mapped name which prevents multiple copies of the same file
+	foreach my $key (keys %{$cfg->{_path_map}}) {
+	    foreach (map {quotemeta} @{$cfg->{_path_map}{$key}}) {
+		if ($uri =~ m#^(?:ht|f)tps?://$_/#) {
+		    $cfg->{debug} && debug_message("Reverse path_map match: $_ -> $key");
+		    $uri =~ s/$_/$key/;
+		    $uri=URI->new($uri);
+		}
+	    }
+	}
+    }
+
+    my @path = $uri->path_segments;
+    shift @path; # Ignore leading /
+
+    if (is_file_type('package', $path[-1])){
+	# We must be fetching a .deb or a .rpm or some other recognised
+	# file, so let's cache it.
+	# Place the file in the cache with its basename, possibly preceded by the namespace
+	if (my $namespace = get_namespace($uri)) {
+	    $cfg->{debug} && debug_message("Using namespace: $namespace");
+	    mkdir_namespace($namespace);
+	    $ret = $namespace . '/';
+	}
+	$ret .= $path[-1];	
+	$cfg->{debug} && debug_message("Package file: $ret");
+	}
+    elsif (is_file_type('installer', $path[-1]) or is_file_type('pdiff', $path[-1])) {
+	# APT, Installer or Debian-live files
+	# Need a unique filename but no freshness checks.
+	# As a special exception, last 2 segments of changelog files are
+	# enough for uniqueness
+	if ($path[-1] eq 'changelog') {
+	    if (my $namespace = get_namespace($uri)) {
+		$cfg->{debug} && debug_message("Using namespace: $namespace");
+		mkdir_namespace($namespace);
+		$ret = $namespace . '/';
+	    }
+	    $ret .= join('_', @path[-2,-1]);
+	    $cfg->{debug} && debug_message("Changelog file: $ret");
+	}
+	else {
+	    $ret = join '_', $uri->authority, @path;
+	    $cfg->{debug} && debug_message("Installer/pdiff file: $ret");
+	}
+    }
+    elsif (is_file_type('index', $path[-1])) {
+	# It's a Packages.gz or related file: make a long filename so we can
+	# cache these files without the names colliding
+	$ret =  join '_', $uri->authority, @path;
+	$cfg->{debug} && debug_message("Index file: $ret");
+    }
+    return $ret;
+}
+
+# Make namespace subdirectories, if required
+sub mkdir_namespace {
+    my ($namespace) = @_;
+
+    foreach (glob("$cfg->{cache_dir}/{headers,packages}/$namespace")) {
+	next if -d;
+	$cfg->{debug} && debug_message("Creating new directory for namespace $_");
+	my $error;
+	mkdir($_, 0755) or $error = $1;
+	warn "Unable to create $_: $error" unless -d;
+    }
+    return;
+}
+
+# Pass URI object which has the first item removed from the path and which is
+# returned
+sub shift_path {
+    my ($uri) = @_;
+
+    my @seg = $uri->path_segments;
+
+    my $ret;
+    while (@seg) {
+	last if ($ret =  shift @seg);
+    }
+
+    $uri->path_segments(@seg ? @seg : undef);
+
+    return $ret;
+}
+
+sub client_permitted {
+    my ($client) = @_;
+
+    if(!$mode || $mode ne 'inetd') {
+	# We only want to respond to clients within an
+	# authorised address range.
+	#
+	# allowed_hosts == '*' means allow all ('' means deny all)
+	# denied_hosts == '' means don't explicitly deny any
+	#
+	# localhost is always accepted
+	# otherwise host must be in allowed list and not in denied list to be accepted
+
+	unless ($client = NetAddr::IP->new($client)) {
+	    info_message("Failed to create NetAddr::IP object for $client");
+	    return;
+	}
+
+	my $map_ipv4_mask = NetAddr::IP::inet_any2n('::ffff:0:');
+	my $map_ipv4 = $client->{isv6} && ($client->aton & $map_ipv4_mask) eq $map_ipv4_mask;
+	if ($map_ipv4) {
+	    $cfg->{debug} && debug_message('client is IPv4 mapped IPv6 address: mapping IPv4 configuration items to IPv6');
+	}
+
+	foreach (qw(127.0.0.1/8 ::1)) { # localhost: IPv4 and IPv6
+	    my $check = NetAddr::IP->new($_);
+	    $check = NetAddr::IP->new(NetAddr::IP::Util::ipv6_n2d(NetAddr::IP::inet_any2n($check->addr) | $map_ipv4_mask), $check->mask)
+	      if !$check->{isv6} && $map_ipv4;
+	    $cfg->{debug} && debug_message("Test client  $client against localhost: $check");
+	    if ($client->within($check)) {
+		$cfg->{debug} && debug_message('Client is localhost');
+		return 1;
+	    }
+	}
+
+	# Now check if the client address falls within the permitted ranges.
+	# Protect each NetAddr::IP->new() on the configuration items with an
+	# eval{} in case it fails from the config item being invalid (it must be
+	# a valid subnet).
+	if ((($cfg->{allowed_hosts} eq '*') ||
+	     List::Util::first {
+		 if (my $check = eval{NetAddr::IP->new($_)}) {
+		     $check = NetAddr::IP->new(NetAddr::IP::Util::ipv6_n2d(NetAddr::IP::inet_any2n($check->addr) | $map_ipv4_mask), $check->mask)
+		       if !$check->{isv6} && $map_ipv4;
+		     $cfg->{debug} && debug_message("Test client $client against allowed: $check");
+		     $client->within($check);
+		 }
+		 else {
+		     info_message("Error: allowed_hosts item $_ is invalid. Ignoring");
+		 }
+	     }
+	     grep {defined} cfg_split($cfg->{allowed_hosts}), cfg_split($cfg->{allowed_hosts_6})
+	    ) &&
+	    !grep {
+		if (my $check = eval{NetAddr::IP->new($_)}) {
+		    $check = NetAddr::IP->new(NetAddr::IP::Util::ipv6_n2d(NetAddr::IP::inet_any2n($check->addr) | $map_ipv4_mask), $check->mask)
+		      if !$check->{isv6} && $map_ipv4;
+		    $cfg->{debug} && debug_message("Test client $client against denied: $check");
+		    $client->within($check);
+		}
+		else {
+		    info_message("Error: denied_hosts item $_ is invalid. Ignoring");
+		}
+	    }
+	    grep {defined} cfg_split($cfg->{denied_hosts}), cfg_split($cfg->{denied_hosts_6})) {
+	    $cfg->{debug} && debug_message("Client $client passed access control rules");
+	    return 1;
+	}
+	return 0;
+    }
+    return 1;
+}
+
+sub ssl_proxy {
+    my ($request,$client) = @_;
+
+    unless ($request->uri->host && $request->uri->port) {
+	return sendrsp(HTTP::Response->new(400, 'Invalid CONNECT request', ['Connection' => 'close']));
+    }
+
+    my ($host,$port) = ($request->uri->host,$request->uri->port);
+
+    my $response;
+
+    # Check config
+    if (!$cfg->{allowed_ssl_ports} ||
+	!$cfg->{allowed_ssl_locations}){
+	info_message('Refused SSL CONNECT: not configured');
+	$response = sendrsp(HTTP::Response->new(403, "SSL CONNECT proxying not configured", ['Connection' => 'close']));
+    }
+    # Limit ports to allowed_ssl_ports and allowed_ssl_locations
+    elsif (!grep ({/^$port$/}
+	       cfg_split($cfg->{allowed_ssl_ports})) ||
+	!grep ({/^$host$/}
+	       cfg_split($cfg->{allowed_ssl_locations}))){
+	info_message("Refused SSL CONNECT $host:$port, not permitted");
+	$response = sendrsp(HTTP::Response->new(403, 'CONNECT to ' . $request->uri . ' not permitted',  ['Connection' => 'close']));
+    }
+    else {
+	$cfg->{debug} && debug_message('Proxy CONNECT to ' . $request->uri->authority);
+	my $ssl = IO::Socket::INET->new(PeerAddr=>$request->uri->host,
+				     PeerPort=>$request->uri->port,
+				     Protocol=>'tcp');
+	unless ($ssl->opened){
+	    die "Failed to CONNECT: $!";
+	}
+	$cfg->{debug} && debug_message('Proxy CONNECTed');
+	$response = sendrsp(HTTP::Response->new(200, 'Connection established', ['Connection' => 'close']));
+	my $s = IO::Select->new($source, $ssl) || die $!;
+	my $count=0;
+      LOOP:
+	while (my @pending = $s->can_read($cfg->{request_timeout})) {
+	    foreach (@pending) {
+		if(defined(my $num=sysread($_, my $buf,65536))) {
+		    local $SIG{PIPE} = sub {$cfg->{debug} && debug_message('Got SIGPIPE whilst proxying')}; # Catch disconnects/write failure
+		    my $writeto = (fileno($_)==fileno($ssl)?$con:$ssl);
+		    last LOOP if !defined(syswrite($writeto,$buf,$num));
+		    $count += $num;
+		}
+	    }
+	}
+	$response->content_length($count);
+	write_access_log('MISS', 'SSL CONNECT: ' . $request->uri, $client, $response);
+    }
+    return $response;
+}
+
+sub handle_connection {
+
+    my $client;
+
+    $cfg->{debug} && debug_message('New '. ($mode ? "\U$mode" : 'Daemon') .' connection');
+
+    if($mode) { # Not standalone daemon
+	$source=*STDIN;
+	$con = *STDOUT;
+
+	# Deprecate CGI mode
+	if($mode eq 'cgi' && $cfg->{cgi_advise_to_use}) {
+	    info_message('Sent 410 error for CGI request');
+	    sendrsp(HTTP::Response->new(410, $cfg->{cgi_advise_to_use}));
+	    return;
+	}
+
+	# identify client in the logs.
+	if (exists $ENV{REMOTE_ADDR}){ # CGI/apt-cacher-cleanup mode
+	    $client=$ENV{REMOTE_ADDR};
+	    $cfg->{daemon_port}=$ENV{SERVER_PORT} if $mode eq 'cgi';
+	}
+	else { # inetd mode
+	    $client='INETD';
+	    $cfg->{daemon_port} = get_inetd_port();
+    	}
+    }
+    else { # Standalone daemon mode
+	$con = shift;
+	$source = $con;
+	$client = $con->peerhost;
+    }
+
+    if (!client_permitted($client)){
+	$cfg->{debug} && debug_message("Alert: client $client disallowed by access control");
+	sendrsp(HTTP::Response->new(403, 'Access to cache prohibited', ['Connection' => 'close']));
+	exit(4);
+    }
+
+    my ($request, $response);
+
+    do {
+	# Get request with timeout to prevent DOS
+	eval {
+	    local $SIG{__DIE__} = 'IGNORE'; # Prevent log verbosity
+	    local $SIG{ALRM} = sub { die "timeout\n" }; # NB: \n required
+	    alarm $cfg->{request_timeout};
+	    $request = get_request();
+	    alarm 0;
+	};
+	if ($@) {
+	    die unless $@ eq "timeout\n";   # propagate unexpected errors
+	    # timed out
+	    $response = sendrsp(HTTP::Response->new(408, 'Timeout waiting for request', ['Connection' => 'close']));
+	}
+	elsif (!defined $request) {
+	    $cfg->{debug} && debug_message('No request');
+	    $response = sendrsp(HTTP::Response->new(400, 'No Request Recieved', ['Connection' => 'close'])) unless $mode && $mode eq 'cgi';
+	}
+	elsif (ref $request eq 'HTTP::Request') {
+	    $response = handle_request($request, $client)
+	}
+	else {
+	    undef $response;
+	}
+    } while ($request == 1) || # get_request() failed but retry OK
+      ($response && lc $response->header('Connection') eq 'keep-alive');
+
+    return;
+}
+
+{ # Scoping block
+    my %concache;
+
+    sub handle_request {
+	my ($request, $client) = @_;
+	my $concloseflag;
+
+	# Internal restricted hash for name, filehandles and status
+	my $cache = Hash::Util::lock_ref_keys_plus({}, qw(name header content status internal));
+
+	# For HTTP/1.0 assume Connection: close, unless specified
+	$request->init_header('Connection' => 'close') if $request->protocol && $request->protocol eq 'HTTP/1.0';
+
+	if ($request->header('Connection') && $request->header('Connection') =~ /close|.*TE/) {
+	    $cfg->{debug} && debug_message('Connection: close');
+	    $concloseflag = 1;
+	}
+
+	# RFC2612 requires bailout for HTTP/1.1 if no Host
+	if ($ request->protocol && $request->protocol eq 'HTTP/1.1' &&
+	    !$request->header('Host')) {
+	    return sendrsp(HTTP::Response->new(400, 'Host Header missing', $concloseflag ? ['Connection' => 'close'] : undef));
+	}
+
+	# Handle SSL proxy CONNECT
+	if ($request->method eq 'CONNECT') {
+	    $concloseflag = 1;
+	    return ssl_proxy($request,$client);
+	}
+
+	# Redirect CGI
+	if ($mode && $mode eq 'cgi' && $cfg->{cgi_redirect} && $cfg->{cgi_redirect} =~ m#^http://#) {
+	    my $redirect = URI->new_abs($request->uri->rel($ENV{SERVER_NAME}), $cfg->{cgi_redirect});
+	    $cfg->{debug} && debug_message("Redirecting CGI to $redirect");
+	    return sendrsp(HTTP::Response->new(301, 'CGI Deprecated. Redirecting to Daemon', ['Location' => $redirect]));
+	}
+
+	foreach ($request->header('Cache-Control'), $request->header('Pragma')) {
+	    if (/no-cache/) {
+		$cache->{status} = 'NOCACHE';
+		$cfg->{debug} && debug_message("Download forced");
+		last;
+	    }
+	}
+
+	if ($request->header('If-Range')){
+	    if (!$request->header('Range')) {
+		info_message('Warning: If-Range specified without Range. Ignoring');
+		$request->remove_header('If-Range');
+	    }
+	    else {
+		# Copy to If-Modified
+		$cfg->{debug} && debug_message('Copied If-Range to If-Modified-Since');
+		$request->header('If-Modified-Since' => $request->header('If-Range'))
+	    }
+	}
+	
+	if ($request->uri->scheme) { # Absolute URI
+	    if ($request->uri->scheme eq 'http' # Only for HTTP
+		&& !$cfg->{_path_map}{$request->uri->host}) { # and not path_mapped
+		# Check if direct host or proxy request
+		my $host = $request->uri->authority;
+		if (defined $concache{$host}) {
+		    $cfg->{debug} && debug_message("Using cached result for host $host in absolute URI");
+		}
+		else {
+		    $cfg->{debug} && debug_message("Checking host $host in absolute URI");
+		    my $host_ip = NetAddr::IP->new($request->uri->host);
+		    if (!$host_ip) {
+			info_message("Unable to resolve to $host");
+			return sendrsp(HTTP::Response->new(504, "Unable to resolve $host", $concloseflag ? ['Connection' => 'close'] : undef));
+		    }			
+
+		    # Both host and port need to be matched.  In inetd mode daemon_port
+		    # is read from inetd.conf by get_inetd_port()
+		    # or $ENV{SERVER_PORT} in CGI mode.
+
+		    # Match ports first as it is cheaper, then go on to match IP addresses
+		    if ((my $host_port = $request->uri->port) ==  $cfg->{daemon_port}) {
+			foreach (!$mode && $cfg->{daemon_addr} ?
+				 grep {defined} cfg_split($cfg->{daemon_addr}) :
+				 keys %{{ map { $_ => 1 } # No duplicates
+					    grep {defined} # or undef
+					      map {$_->address} IO::Interface::Simple->interfaces
+					  }}) {
+			    $cfg->{debug} && debug_message("$_ <=> $host_ip");
+			    $concache{$host} = $host_ip->within(NetAddr::IP->new($_)) and last;
+			}
+		    }
+		    else {
+			$concache{$host} = 0;
+			$cfg->{debug} && debug_message("Different ports in absolute URI: $cfg->{daemon_port} <=> $host_port");
+		    }
+		}
+
+		if ($concache{$host}) { # Host is this host
+		    $cfg->{debug} && debug_message('Host in Absolute URI is this server');
+		    # Set host, with optional port, to first path segment
+		    $request->uri->authority(shift_path($request->uri));
+		}
+		else { # Proxy request
+		    $cfg->{debug} && debug_message('Host in Absolute URI is not this server');
+		}
+	    }
+	}
+	else { # Relative URI
+	    if ($request->uri->path =~ /^\/?report\/?$/) {
+		return usage_report();
+	    } else {
+		$request->uri->scheme('http');
+		$request->uri->authority(shift_path($request->uri)); # First path element is actually the host
+	    }
+	}
+	
+	$cfg->{debug} && debug_message('Resolved request is '. $request->uri);
+
+	# Now check the path
+	if ( !$request->uri->host || !$request->uri->path ) {
+	    return usage_error($client);
+	}
+
+	if (!($request->uri->path_segments)[-1]) {
+	    $cfg->{debug} && debug_message("No filename in request ${\$request->uri}. Skipping");
+	    return sendrsp(HTTP::Response->new(403, 'Sorry, no filename given. Proxy for directories not permitted', $concloseflag ? ['Connection' => 'close'] : undef));
+	}
+
+	if($cfg->{allowed_locations}) {
+	  LOCATION: {
+		# $cfg->{debug} && debug_message('Doing location check for '.$cfg->{allowed_locations} );
+		for(map {quotemeta} cfg_split($cfg->{allowed_locations})) {
+		    s#(?<!/)$#/#; # End at a segment boundary (if not present)
+		    $_ = "^$_"; # Anchor at the beginning
+		    $cfg->{debug} && debug_message('Testing URI: ' . $request->uri->authority . $request->uri->path . " against $_");
+		    last LOCATION if ($request->uri->authority.$request->uri->path) =~ /$_/;
+		}
+		my $mess = 'URI ' . $request->uri . ' is not permitted by the allowed_locations configuration';
+		$cfg->{debug} && debug_message("$mess; access denied");
+		return sendrsp(HTTP::Response->new(403, "Access to cache prohibited, $mess", $concloseflag ? ['Connection' => 'close'] : undef));
+	    }
+	}
+
+
+	# Handle SOAP POST
+	if ($request->method eq 'POST') {
+	    if ($request->uri =~ $cfg->{soap_url_regexp}) {
+		return soap_post($request, $client);
+	    }
+	    else {
+		$cfg->{debug} && debug_message('Access to POST URL ' . $request->uri . ' denied');
+		return sendrsp(HTTP::Response->new(403, 'Access to this POST URL prohibited', $concloseflag ? ['Connection' => 'close'] : undef));
+	    }
+	}
+
+	unless ($cache->{name} = new_filename($request->uri)) {
+	    # Maybe someone's trying to use us as a general purpose proxy / relay.
+	    # Let's stomp on that now.
+	    $cfg->{debug} && debug_message('Sorry, not allowed to fetch that type of file: '.($request->uri->path_segments)[-1]);
+	    return sendrsp(HTTP::Response->new(403, 'Sorry, not allowed to fetch that type of file: '.($request->uri->path_segments)[-1], $concloseflag ? ['Connection' => 'close'] : undef));
+	}
+
+	$cache->{internal} = ($client eq 'INTERNAL');
+	
+      cached_response:
+	my ($response);
+
+	# Open/create, lock and read the cached response
+	for (my $cached_head = "$cfg->{cache_dir}/headers/$cache->{name}") {
+	    sysopen($cache->{header}, $cached_head, O_RDWR|O_CREAT)
+	      || die  "Failed to open/create $cached_head: $!";
+	    _flock($cache->{header}, LOCK_EX) || die "Lock header failed: $!";
+	    $cfg->{debug} && debug_message("Locked header $cached_head");
+	}
+
+	# Open/create cached file
+	for (my $cached_file = "$cfg->{cache_dir}/packages/$cache->{name}") {
+	    unlink $cached_file if $cache->{status} && $cache->{status} eq 'NOCACHE'; # Ensure new file for Cache-Control: no-cache
+	    sysopen($cache->{content}, $cached_file, O_RDWR|O_CREAT)
+	      || die "Failed to open/create $cached_file for return: $!";
+	}
+	
+	# Existing response
+	if ((my $cached_response = read_header($cache->{header})) && (!$cache->{status} || $cache->{status} eq 'OFFLINE')){
+	    # Revalidate cached file, if required
+	    # Don't bother for package files as they shouldn't change.
+	    # Also skip in offline mode
+	    if (!$cfg->{offline_mode} &&
+		!is_file_type('package', $request->uri->path) &&
+		!$cache->{status}) {
+
+		$cfg->{debug} && debug_message('Freshness checks');
+		my $maxage;
+		($maxage) = ($request->header('Cache-Control') =~ /max-age=(\d+)/)	
+		  if $request->header('Cache-Control');
+		
+		# If fresh or less than specified Cache-Control: max-age
+		if ($cached_response->is_fresh &&
+		    $cached_response->date &&
+		    $cached_response->client_date &&
+		    (!defined($maxage) || $cached_response->header('Age') <= $maxage)) {
+		    $cfg->{debug} && debug_message("Cached file $cache->{name} is fresh. Age: " . $cached_response->header('Age'));
+		}
+		else {
+		    $cfg->{debug} && debug_message("Revalidating $cache->{name}. Age: " . $cached_response->header('Age'));
+		    if($cfg->{expire_hours} > 0) {
+			my $now = time();
+			my @stat = stat($cache->{content});
+			if (@stat && int(($now - $stat[9])/3600) > $cfg->{expire_hours}) {
+			    $cfg->{debug} && debug_message("Refreshing $cache->{name} because it is too old");
+			    # Set the status to EXPIRED so the log file can show it
+			    # was downloaded again
+			    $cache->{status} = 'EXPIRED';
+			    $cfg->{debug} && debug_message($cache->{status});
+			}
+		    }
+		    # Send If-modified-since request for http, https or proxy request
+		    elsif (($request->uri->scheme =~ /https?/ || $cfg->{use_proxy}) &&
+			   (my $since = $cached_response->header('Last-Modified'))){
+			$cfg->{debug} && debug_message('Sending If-Modified-Since request');
+			my $ifmod_request = upstream_request($request);
+			$ifmod_request->header('If-Modified-Since' => $since);
+			$response = fetch_store($ifmod_request, $cache);
+			$cfg->{debug} && debug_message('Got '.$response->code);
+			if ($response->code == 200) {
+			    $cache->{status} = 'EXPIRED';
+			    $cfg->{debug} && debug_message($cache->{status});
+			}
+			elsif ($response->code == 304) {
+			    # Update cached Date and Client-Date headers
+			    $cached_response->date($response->date || time);
+			    write_header($cache->{header}, $cached_response);
+			}
+			elsif ($response->is_error) {
+			    # Offline, used cached
+			    $cache->{status} = 'OFFLINE';
+			}
+		    }
+		    # Still don't know what to do?
+		    # use HTTP timestamping/ETag
+		    elsif (my $head_response = libcurl(upstream_request($request, 'HEAD'), $cache)){ # HEAD only
+			
+			# First check status
+			if ((my $oldstat = $cached_response->code || 'undef') ne (my $newstat = $head_response->code)) {
+			    $cfg->{debug} && debug_message("Cached header status changed from $oldstat to $newstat");
+			    $cache->{status} = 'EXPIRED';
+			    $cfg->{debug} && debug_message($cache->{status});
+			}
+			# Don't use ETag by default for now: broken on some servers
+			elsif($cfg->{use_etags} &&
+			      (my $oldtag = $cached_response->header('ETag')) &&
+			      (my $newtag = $head_response->header('ETag'))) { # Try ETag first
+			    if ($oldtag eq $newtag) {
+				$cfg->{debug} && debug_message("ETag headers match, $oldtag <-> $newtag. Cached file unchanged");
+			    }
+			    else {
+				$cfg->{debug} && debug_message("ETag headers different, $oldtag <-> $newtag. Refreshing cached file");
+				$cache->{status} = 'EXPIRED';
+				$cfg->{debug} && debug_message($cache->{status});
+			    }
+			}
+			elsif((my $oldmod = $cached_response->header('Last-Modified')) &&
+			      (my $newmod = $head_response->header('Last-Modified'))){
+			    if (str2time($oldmod) >= str2time($newmod)) {
+				# that's ok
+				$cfg->{debug} && debug_message("cached file is up to date or more recent, $oldmod <-> $newmod");
+			    }
+			    else {
+				if ($oldmod && $newmod) {
+				    $cfg->{debug} && debug_message("downloading $cache->{name} because more recent version is available: $oldmod <-> $newmod");
+				}
+				else {
+				    $cfg->{debug} && debug_message("downloading $cache->{name} because modification information incomplete");
+				}
+				$cache->{status} = 'EXPIRED';
+				$cfg->{debug} && debug_message($cache->{status});
+			    }
+			}
+		    }
+		    else {
+			$cfg->{debug} && debug_message('Validation failed: reusing existing file');
+			$cache->{status} = 'OFFLINE';
+		    }
+		}
+	    }
+
+	    # Check complete file present
+	  complete_check:
+	    if(!$cache->{status} || $cache->{status} eq 'OFFLINE') {
+		$cfg->{debug} && debug_message('Complete check');
+		my $clength = $cached_response->content_length;
+		unless (defined $clength) {
+		    info_message('Warning: failed to read cached Content-Length');
+		    unlink_by_fh($cache->{header}, $cache->{content});
+		    goto cached_response;
+		}
+		if (-s $cache->{content} == $clength) {
+		    # not much to do if size is same as Content-Length
+		    $cfg->{debug} && debug_message("cached file is complete: $clength");
+		}
+		else {
+		    # a fetcher was either not successful or is still running
+		    # look for activity...
+		    if (flock($cache->{content}, LOCK_SH|LOCK_NB)) {
+			_flock($cache->{content}, LOCK_UN);
+			# No fetcher working on this package. Redownload it.
+			$cfg->{debug} && debug_message('Incomplete, no fetcher running, downloading');
+			$cache->{status} = 'MISS'; # Force download
+			undef $response;
+			goto complete_check;
+		    }
+		    else {
+			$cfg->{debug} && debug_message('Incomplete, another fetcher already working on file');
+		    }
+		}
+		$response=$cached_response;
+		$cache->{status} = ($request->method eq 'HEAD' ? 'HEAD' : 'HIT') unless $cache->{status};
+		$cfg->{debug} && debug_message($cache->{status});
+	    }
+	}
+
+	if (!$response) {
+	    # bypass for offline mode, no forking, just report the "problem"
+	    if($cfg->{offline_mode})
+	      {
+		  return sendrsp(HTTP::Response->new(503, 'Service not available: apt-cacher offline', $concloseflag ? ['Connection' => 'close'] : undef));
+	      }
+	    # (re) download them
+	    $cfg->{debug} && debug_message('file does not exist or download required');
+
+	    # Set the status to MISS so the log file can show it had to be downloaded
+	    # except on special presets from index file checks above
+	    if(!$cache->{status}) {
+		$cache->{status} = 'MISS';
+		$cfg->{debug} && debug_message($cache->{status});
+	    }
+	    $response = fetch_store(upstream_request($request), $cache);
+	}
+
+	_flock($cache->{header}, LOCK_UN) || die "Failed to unlock header: $!";
+	$cfg->{debug} && debug_message('Unlocked header, checks done, can return now');
+
+	# Handle If-Modified-Since
+	if($response->is_success && $request->header('If-Modified-Since')) {
+	    my $lastmod = $response->header('Last-Modified');
+	    if($lastmod && str2time($request->header('If-Modified-Since')) >= str2time($lastmod)) {
+		$cfg->{debug} && debug_message('File not changed: '. $request->header('If-Modified-Since'));
+		unless ($request->header('If-Range')) { # For If-Range, go on to complete Range request
+		    write_access_log('NOTMOD', $cache->{name}, $client, $response);
+		    return sendrsp(HTTP::Response->new(304, 'Not Modified', $concloseflag ? ['Connection' => 'close'] : undef));
+		}
+	    }
+	    else { # Modified
+		$request->remove_header('Range') if ($request->header('If-Range')); # For If-Range, return whole file
+	    }
+	}
+
+	if ($cache->{internal}) {
+	    $cfg->{debug} && debug_message('Internal request, not returning file');
+	    write_access_log('REFRESH', $cache->{name}, $client, $response) if $response->is_success;
+	    return $response;
+	}
+
+	$response->request($request);
+
+	# Connection: close? Follow the client
+	if ($concloseflag) {
+	    $response->header('Connection' => 'close');
+	}
+	else {
+	    # Remove Connection header and options
+	    foreach ($response->header('Connection')) {
+		$response->remove_header($_)
+	    }
+	    $response->remove_header('Connection');
+	}
+
+	my $ret = return_file ($response, $cache);
+	if ($ret && $ret==2) { # retry code
+	    $cfg->{debug} && debug_message('return_file requested retry');
+	    goto complete_check;
+	}
+	$cfg->{debug} && debug_message('Package sent');
+
+	# Write all the stuff to the log file
+	write_access_log($cache->{status}, $cache->{name}, $client, $response) if $response->is_success;
+
+	return $response;
+    }
+}
+
+sub return_file {
+    # At this point the file is open, and it's either complete or somebody
+    # is fetching its contents
+
+    my ($response, $cache) = @_;
+
+    my $explen;
+    my $curlen = 0;
+
+    if ($response->is_success){
+	$explen = $response->content_length;
+    }
+    else {
+	# Error or redirect
+	$response->remove_content_headers;
+	$response->content_length(0)
+    }
+
+    # Handle Ranges
+    if ($response->request->header('Range') &&
+	(my ($rangereq) = ($response->request->header('Range') =~ /^bytes=(\d*-\d*)/))
+	&& $response->is_success) {
+	unless ($rangereq =~ /,/) { # Don't support multiple ranges
+	    $cfg->{debug} && debug_message("Handling range request: $rangereq");
+	    $rangereq =~ /^(\d+)?-(\d+)?$/;
+	    my $range_begin = $1 || 0;
+	    my $range_end = $2 || $explen-1;
+	    if (($range_begin > $range_end) ||
+		$range_end == 0) {
+		info_message("Invalid range: $rangereq (cached length $explen)");
+		sendrsp(HTTP::Response->new(416, "Invalid range: $rangereq", ['Content-Range' => "bytes */$explen"]));
+		return;
+	    }
+	    $cfg->{debug} && debug_message("Range bytes: $range_begin-$range_end/$explen");
+	    if ($range_end >= $explen || $range_begin >= $explen) {
+		sendrsp(HTTP::Response->new(416, 'Range outside available bytes'));
+		return;
+	    }
+	    $response->header('Content-Range' => "bytes $range_begin-$range_end/$explen");
+	    $response->code(206);
+	    $response->message('Partial Content');
+	    $response->content_length($range_end - $range_begin + 1); # Size of Partial Content
+	    $curlen = $range_begin;
+	}
+	else {
+	    info_message('Warning: multiple ranges not supported'); # Just go on to return the whole content
+	}
+    }
+
+    # Send header first
+    sendrsp($response);
+
+    # Stop after sending error or redirect header
+    # or pure HEAD request
+    return if !$response->is_success || $response->request->method eq 'HEAD';
+
+    # Rewind or seek initial position for Range
+    seek($cache->{content},$curlen,0)|| die 'seek (' . filename_fh($cache->{content}) . ") failed with $!";
+
+    $cfg->{debug} && debug_message('ready to send contents of ' . filename_fh($cache->{content}));
+
+    my $abort_time = get_abort_time();
+    my $sleep=0.01;
+    my $fetcher_done;
+    $cfg->{use_sendfile} = Sys::Syscall::sendfile_defined() unless exists $cfg->{use_sendfile}; # sendfile(3) not available on all systems
+	
+  CHUNK:
+    while (time() <= $abort_time) {
+	my $n;
+	while (($n = ($cfg->{use_sendfile} ?
+		     Sys::Syscall::sendfile(fileno($con), fileno($cache->{content}), $explen-$curlen) : # Use if possible
+		     read($cache->{content}, my $buf, $cfg->{return_buffer_size}/2**$sleep))) # Fallback. Reduce read size if we have to sleep a lot
+	       > 0 # Sendfile will return -1 on error
+	      ) {
+	    $curlen += $n;
+	    if($explen && $curlen > $explen) {
+		my $cached_file = filename_fh($cache->{content});
+		info_message("ALARM! $cached_file is larger than expected ($curlen > $explen). Renaming to $cached_file.corrupted.");
+		unlink "$cached_file.corrupted";
+		link($cached_file, "$cached_file.corrupted");
+		_flock($cache->{header}, LOCK_EX);
+		unlink_by_fh($cache->{header}, $cache->{content});
+		exit(5); # Header already sent, can't notify error
+	    }
+	    # Send data if not using sendfile
+	    print $con $buf unless $cfg->{use_sendfile};
+	    # update watchdog
+	    $cfg->{debug} && debug_message(($cfg->{use_sendfile} ? 'sendfile ' : 'read/print ') . "wrote $n (sum: $curlen) bytes");
+	    $abort_time = get_abort_time();
+	    $sleep = 0.01; # Reset
+	}
+	
+	if(!defined($n)) {
+	    info_message("Read error: $!");
+	    exit(4); # Header already sent, can't notify error
+	}
+
+	if ($cfg->{use_sendfile} && $n == -1 ){
+	    info_message("Sendfile failed: $!");
+	    if ($! == POSIX::ENOSYS || $! == POSIX::EINVAL) {
+		info_message("Retrying with read/print");
+		$cfg->{use_sendfile} = 0;
+		redo CHUNK;
+	    }
+	    exit(4); # Header already sent, can't notify error
+	}
+
+	if($n == 0) {
+	    if($fetcher_done) {
+		# fetcher lock released on the previous iteration
+		# this is the loop exit condition
+		if($explen && $curlen != $explen) {
+		    # final check on size
+		    my $cached_file = filename_fh($cache->{content});
+		    info_message("ALARM! $cached_file file size mismatch (found $curlen, expected $explen). Renaming to $cached_file.corrupted.");
+		    unlink "$cached_file.corrupted";
+		    link($cached_file, "$cached_file.corrupted");
+		    _flock($cache->{header}, LOCK_EX);
+		    unlink_by_fh($cache->{header}, $cache->{content});
+		    exit(5); # Header already sent, can't notify error. Pipelining hosed, so bail out
+		}
+		# Checksum
+		if(!is_file_type('skip_checksum', $response->request->uri->path)
+		   && !is_file_type('installer', $response->request->uri->path)
+		   && !check_sum($cache->{name}, $cache->{content})) {
+		    if (is_file_type('index', $response->request->uri->path)) {
+			# If an index file, refresh the Release file to update
+			# the checksum database. Leave the client to retry.
+			info_message('Checksum mismatch on '  . filename_fh($cache->{content}) . '. Removing and refreshing Release file');
+			refresh_release($response->request->uri);
+		    }
+		    else {
+			info_message('ALARM! ' . filename_fh($cache->{content}) . ' checksum invalid! Removing.');
+		    }
+		    _flock($cache->{header}, LOCK_EX);
+		    unlink_by_fh($cache->{header}, $cache->{content});
+		    _flock($cache->{header}, LOCK_UN);
+		    # Header already sent, can't notify error, just continue
+		}
+		_flock($cache->{content},LOCK_UN) || die "Unlock failed: $!";
+		$cfg->{debug} && debug_message('Released return read lock');
+		return; # Normal return
+	    }
+
+	    if (flock($cache->{content},LOCK_SH|LOCK_NB)) {
+		# do another iteration, may need to read remaining data
+		$cfg->{debug} && debug_message('Got return read lock');
+		$fetcher_done = 1;
+	    }
+	    else {
+		# wait for fresh data using exponential backoff up to 1
+		$cfg->{debug} && debug_message("waiting for new data for $sleep seconds");
+		sleep($sleep **= 1-$sleep);
+	    }
+	    $cache->{content}->clearerr; # Reset EOF
+	}
+    }
+    $explen = 'unknown' unless defined $explen;
+    info_message('return_file ' . filename_fh($cache->{content}) . " aborted by timeout at $curlen of $explen bytes");
+    exit(4); # Header already sent, can't notify error
+}
+
+sub usage_error {
+    my $hosturl;
+    my $modestr;
+    if ($mode && $mode eq 'cgi') {
+	$hosturl = Sys::Hostname::hostname . '/[cgi-bin/]apt-cacher';
+	$modestr = 'CGI mode';
+    }
+    else {
+	$hosturl = Sys::Hostname::hostname . ':' . $cfg->{daemon_port};
+	$modestr = 'Daemon mode';
+	$modestr .= ' [inetd]' if ($mode && $mode eq 'inetd');
+    }
+
+    open_log_files();
+    write_error_log("$_[0]|--- $0: Usage error");
+
+    my $content = <<EOF;
+<html>
+<title>Apt-cacher version $version: $modestr</title>
+<style type="text/css"><!--
+a { text-decoration: none; }
+a:hover { text-decoration: underline; }
+h1 { font-family: arial, helvetica, sans-serif; font-size: 18pt; font-weight: bold;}
+h2 { font-family: arial, helvetica, sans-serif; font-size: 14pt; font-weight: bold;}
+body, td { font-family: arial, helvetica, sans-serif; font-size: 10pt; }
+th { font-family: arial, helvetica, sans-serif; font-size: 11pt; font-weight: bold; }
+//--></style>
+</head>
+<body>
+<p>
+<table border=0 cellpadding=8 cellspacing=1 bgcolor="#000000" align="center" width="600">
+<tr bgcolor="#9999cc">
+<td>
+<h1>Apt-cacher version $version: $modestr</h1>
+</td>
+</tr>
+<tr bgcolor="#cccccc">
+<td>
+Usage: 
+<p>Edit /etc/apt/apt.conf to include the configuration
+<blockquote>Acquire::http::proxy=http://$hosturl</blockquote>
+Alternatively, edit /etc/apt/sources.list so all your HTTP sources are prepended
+with the address of your apt-cacher machine and the port, like this:
+<blockquote>deb&nbsp;http://example.debian.org/debian&nbsp;unstable&nbsp;main&nbsp;contrib&nbsp;non-free</blockquote>
+becomes
+<blockquote>deb&nbsp;http://<b>$hosturl/</b>example.debian.org/debian&nbsp;unstable&nbsp;main&nbsp;contrib&nbsp;non-free</blockquote>
+</td>
+</tr>
+</table>
+
+<h2 align="center">Configuration: $cfg->{_config_file}</h2>
+<table border=0 cellpadding=3 cellspacing=1 bgcolor="#000000" align="center">
+<tr bgcolor="#9999cc"><th> Directive </th><th> Value </th></tr>
+EOF
+    # Iterate through $cfg and tabulate
+    # Sort alphabetically, with regexps last
+    foreach  (sort {$a =~ /regexp/ <=> $b =~ /regexp/ || $a cmp $b} (keys %$cfg)) {
+	next if (ref $cfg->{$_} && ref $cfg->{$_} ne 'Regexp') || /^_/; # Skip anything that is not a scalar (other than Regexps) or is private
+	$content .= "<tr bgcolor=\"#cccccc\" align=\"left\"> \
+		<td bgcolor=\"#ccccff\"> $_ </td> \
+		<td> $cfg->{$_} </td> \
+	     </tr>\n";
+    }
+
+    $content .= <<EOF;
+</table>
+<p>
+<h2 align="center">License</h2>
+<table border=0 cellpadding=8 cellspacing=1 bgcolor="#000000" align="center"
+width="600">
+<tr bgcolor="#cccccc">
+<td>
+<p>Apt-cacher is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 2 of the License, or (at your option) any later
+version.
+<p>Apt-cacher is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+<p>A copy of the GNU General Public License is available as
+/usr/share/common-licenses/GPL in the Debian GNU/Linux distribution or on the
+World Wide Web at http://www.gnu.org/copyleft/gpl.html. You can also obtain it
+by writing to the Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+Boston, MA 02111-1307, USA.
+</td>
+</tr>
+</table>
+</body>
+</html>
+EOF
+    return sendrsp(HTTP::Response->new(200, 'OK', ['Content-Type' => 'text/html', 'Expires' => 0, 'Connection' => 'close'], $content));
+}
+
+# Jon's extra stuff to write the event to a log file.
+sub write_access_log {
+    my ($cache_status, $item, $client, $response) = @_;
+
+    my $time = localtime;
+    my $length = $response->content_length;
+
+    _flock($aclog_fh, LOCK_EX);
+    seek($aclog_fh, 0, 2); # Reset EOF to SEEK_END
+    print $aclog_fh "$time|$$|$client|$cache_status|$length|$item\n";
+    _flock($aclog_fh, LOCK_UN);
+    return;
+}
+
+# Jon's extra stuff to write errors to a log file.
+sub write_error_log {
+    my ($message) = @_;
+
+    my $time = localtime;
+
+    # Prevent double newline
+    chomp $message;
+
+    if (!defined $erlog_fh) {
+	print STDERR "$message\n"; # Better than nothing
+	return;
+    }
+    _flock($erlog_fh, LOCK_EX);
+    seek($erlog_fh, 0, 2); # Reset EOF to SEEK_END
+    print $erlog_fh "$time|$message\n";
+    _flock($erlog_fh, LOCK_UN);
+    return;
+}
+
+sub die_handler {
+    my ($msg) = @_;
+    write_error_log("error [$$]: $msg");
+    sendrsp(HTTP::Response->new(502, 'apt-cacher internal error (died)', ['Connection' => 'close']));
+    return;
+}
+
+# Stuff to append debug messages to the error log.
+sub debug_message {
+    if ($cfg->{debug}) {
+	my ($message) = @_;
+	write_error_log("debug [$$]: $message");
+    }
+    return;
+}
+
+sub info_message {
+    my ($message) = @_;
+    write_error_log("info [$$]: $message");
+    return;
+}
+
+sub open_log_files {
+    my $logfile = "$cfg->{log_dir}/access.log";
+    my $errorfile = "$cfg->{log_dir}/error.log";
+
+    if(!$erlog_fh) {
+	open($erlog_fh, '>>', $errorfile) or die "Unable to open $errorfile, $!";
+    }
+    if(!$aclog_fh) {
+	open($aclog_fh,'>>', $logfile) or die "Unable to open $logfile, $!";
+    }
+    return;
+}
+
+sub get_abort_time {
+    return time () + $cfg->{data_timeout};
+}
+
+# Returns a copy of an HTTP::Request witht he cache control headers propagated.
+# Optional second argument sets new verb/method
+sub upstream_request {
+    my ($request, $verb) = @_;
+
+    return unless ref $request eq 'HTTP::Request';
+
+    my $new = HTTP::Request->new( $verb ? $verb : $request->method,
+				  $request->uri);
+
+    my @preserve = qw{Cache-Control Pragma}; # Propagate Cache-Control headers
+    if ($request->method eq 'POST') {# SOAP
+	$new->content($request->content);
+	push(@preserve, 'Content-Type');
+    }
+
+    foreach (@preserve) {
+	$new->header($_ => $request->header($_));
+    }
+
+    return $new;
+}
+
+{ # Scoping block
+    my $headers;
+    sub ftp_header_callback {
+	my ($chunk,$fh) = @_;
+
+	# $cfg->{debug} && debug_message("FTP header handler: $chunk");
+	if (my($code,$data)= ($chunk =~ /^(\d+) (.+)\r\n/ )) { # FTP response
+	    my $response;
+	  FTP_HEADER:
+	    for ($code) {
+		/^(?:1|3)50$/ && do {
+		    $response=HTTP::Response->new(200, $data, $headers);
+		    last FTP_HEADER;
+		};
+		/^550$/ && do {
+		    $response=HTTP::Response->new(404, $data, $headers);
+		    last FTP_HEADER;
+		};
+		/^213$/ && do { # File stats
+		    unless ($data !~ /^\d{14}$/ || $headers->last_modified) {
+			my $t = Time::Piece->strptime($data,"%Y%m%d%H%M%S");
+			unless ($t) {
+			    info_message("Failed to parse $data as date");
+			    last FTP_HEADER;
+			}
+			$cfg->{debug} && debug_message('Parsed LMDT as '.$t);
+			$headers->last_modified($t->epoch);
+		    }
+		    else {
+			$headers->content_length($data);
+		    }
+		    last FTP_HEADER;
+		};
+		/^230$/ && do { # Login
+		    $headers=HTTP::Headers->new;
+		    $headers->date(time);
+		    last FTP_HEADER;
+		};
+		/^(?:200|220|221|226|229|250|257|331)$/ && do { # Ignore
+		    last FTP_HEADER;
+		};
+		 $cfg->{debug} && debug_message("Unhandled FTP response: $code $data");
+	    }
+	    if ($response) {
+		$cfg->{debug} && debug_message("FTP header conversion complete, sending");
+		$response->protocol('HTTP/1.0');
+		print $fh $response->as_string("\r\n");
+	    }
+	}
+	else {
+	    $cfg->{debug} && debug_message("Unhandled header: $chunk");
+	}
+	return length($chunk);
+    }
+}
+
+sub debug_callback {
+    my ($data, $level, $type) = @_;
+    write_error_log "debug [$$]: CURLINFO_"
+      .('TEXT','HEADER_IN','HEADER_OUT','DATA_IN','DATA_OUT','SSL_DATA_IN','SSL_DATA_OUT')[$type]
+	.": $data" if ($type < $level);
+    return 0; # Must return 0 not undef
+}
+
+# returns a socket to the libcurl process
+sub connect_curlm {
+    my $conn;
+    set_global_lock('Connect libcurl');
+    # Check for running server
+    if ($conn = IO::Socket::UNIX->new($cfg->{libcurl_socket})) {
+	$cfg->{debug} && debug_message("Connection to running libcurl process found on $cfg->{libcurl_socket}");
+	release_global_lock();
+    }
+    else {
+	defined(my $lc_pid = fork()) || die "fork() for libcurl failed: $!";
+	if ($lc_pid == 0) {
+	    # Child, the libcurl thread
+	    $cfg->{debug} && debug_message('Fork libcurl thread');
+	    setpgrp(0,0); # New process group
+
+	    # Ensure scheme specific modules loaded
+	    require URI::ftp;
+	    require URI::http;
+	    require URI::https;
+
+	    # Close all file descriptors except error log and global lock
+	    for (0 .. POSIX::sysconf(POSIX::_SC_OPEN_MAX)) {
+		next if ($_ == $erlog_fh->fileno) or ($_ == global_lock_fh()->fileno);
+		POSIX::close($_);
+	    }
+
+	    local $0 = __FILE__ . ' [libcurl]'; # Visible to ps and friends
+
+	    unlink $cfg->{libcurl_socket};
+	    my $server = IO::Socket::UNIX->new(Proto => 'tcp',
+					       Local => $cfg->{libcurl_socket},
+					       Listen => SOMAXCONN,
+					       Reuse => 1)
+	      or die "Unable to create libcurl socket $cfg->{libcurl_socket}: $!";
+	    chmod 0600, $cfg->{libcurl_socket} or die "Unable to set permissions: $!";
+
+	    release_global_lock();
+
+	    my $select = IO::Select->new($server) or die "Unable to create select: $!";
+	    my $curlm = WWW::Curl::Multi->new;
+	    my $curlsh = WWW::Curl::Share->new;
+	    $curlsh->setopt(CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+	    my %easy; # hash to hold requests
+	    my $active_handles = 0;
+	    my $idcounter=1;
+
+	  LIBCURL_TIMEOUT:
+	    while ($select->can_read($cfg->{curl_idle_timeout})) {
+	      LIBCURL_REQUEST:
+		{
+		    my $client = $server->accept();
+		    $cfg->{debug} && debug_message('libcurl: new connection');
+		    # deal with connection here
+		    my $ice = do {
+			local $/ = "\n\n";
+			$client->getline;
+		    };
+		    {
+			local $/ = '';
+			chomp($ice); # Remove the 2 \n
+		    }
+		    if ($ice eq 'EXIT') {
+			info_message('libcurl exit requested');
+			last LIBCURL_TIMEOUT;
+		    }
+		    elsif ($ice !~ /^FrT;/) {
+			info_message('Error: [libcurl] Bad request format');
+			next LIBCURL_TIMEOUT;
+		    }
+		    my ($request, $request_cfg) = thaw($ice); # Decode request
+		    $cfg->{debug} && debug_message('Libcurl: thawed request '. $request->method . ' ' . $request->uri . ' with headers ' . $request->headers->as_string);
+		    # Verify input
+		    if ($request->uri !~ m!^(?:ftp|https?)://[-~\w+\.]+!i) {
+			info_message("Error: [libcurl] Bad request received $ice");
+			$client->close;
+		    }
+		    else {
+			$client->shutdown(0); # Finished reading
+
+			my $curl = init_curl($request_cfg, ++$active_handles);
+			$curl->setopt(CURLOPT_SHARE, $curlsh);
+			$easy{$idcounter}=[$client,$curl];
+			$cfg->{debug} && debug_message("Add curl handle #$idcounter: for " . $request->uri);
+			$curl->setopt(CURLOPT_PRIVATE,$idcounter++); # Assign Multi ID
+			# attach to WWW::Curl::Multi
+			$curlm->add_handle($curl);
+			
+			$cfg->{debug} && debug_message ('libcurl: setting up for ' . $request->method . ' request');
+			if($request->method eq 'POST') {
+			    $curl->setopt(CURLOPT_POST, 1);
+			    $curl->setopt(CURLOPT_POSTFIELDS, $request->content);
+			    $curl->setopt(CURLOPT_POSTFIELDSIZE, length($request->content));
+			    $curl->setopt(CURLOPT_FILE, $client);
+			}
+			elsif($request->method eq 'HEAD') {
+			    $curl->setopt(CURLOPT_NOBODY,1);
+			}
+			else {
+			    $curl->setopt(CURLOPT_HTTPGET,1);
+			    $curl->setopt(CURLOPT_FILE, $client);
+			}
+
+			$curl->setopt(CURLOPT_HTTPHEADER, [map {"$_: " . $request->header($_)} $request->header_field_names]);
+			
+			$curl->setopt(CURLOPT_URL, $request->uri);
+			if (!$request_cfg->{use_proxy}) {
+			    if ($request->uri->scheme eq 'ftp') {
+				$cfg->{debug} && debug_message ('libcurl: setting up for FTP request');
+				$curl->setopt(CURLOPT_FILETIME, 1);
+				$curl->setopt(CURLOPT_FTPPORT, '-');
+				$curl->setopt(CURLOPT_FTP_USE_EPRT, 1);
+				$curl->setopt(CURLOPT_FTP_USE_EPSV, 1);
+				$curl->setopt(CURLOPT_FTP_FILEMETHOD, 2); # CURLFTPMETHOD_NOCWD
+				$curl->setopt(CURLOPT_HEADERFUNCTION, \&ftp_header_callback)
+			    }
+			    elsif ($request->uri->scheme eq 'https') {
+				$curl->setopt(CURLOPT_SSL_VERIFYPEER, !$request_cfg->{curl_ssl_insecure});
+			    }
+			}
+			$curl->setopt(CURLOPT_WRITEHEADER, $client);
+		    }
+			
+		    while ($active_handles) {
+			my $active_transfers = $curlm->perform;
+			if ($active_transfers != $active_handles) {
+			    while (my ($id,$return_value) = $curlm->info_read)  {
+				$cfg->{debug} && debug_message("curl handle #$id completed, status: $return_value");
+				$active_handles--;
+				my($client_socket,$client_curl)=@{$easy{$id}};
+				print $client_socket "APT-CACHER_LIBCURL_STATUS=$return_value\n";
+				# undef CURLOPT_WRITEHEADER otherwise
+				# "semi-panic: attempt to dup freed
+				# string" error in response to FTP QUIT
+				$client_curl->setopt(CURLOPT_WRITEHEADER, undef);
+				$client_socket->shutdown(2); # Done
+				delete $easy{$id};
+				$cfg->{debug} && debug_message("libcurl active transfers: $active_transfers");
+			    }
+			}
+			# Check for pending new request. Use a small select
+			# timeout here which also prevents the parent while
+			# loop from running too fast and hogging the CPU
+			# uselessly.
+			if ($active_handles && $select->can_read($cfg->{_curl_throttle})) {
+			    $cfg->{debug} && debug_message('Pending connection');
+			    next LIBCURL_REQUEST;
+			}
+		    }
+		}
+	    }
+
+	    unlink $cfg->{libcurl_socket};
+	    $cfg->{debug} && debug_message("Libcurl thread inactive. Exiting");
+	    exit(0);
+	}
+	else {
+	    # Parent
+	    while (kill 0, $lc_pid){ # Still running
+		if ($conn = IO::Socket::UNIX->new($cfg->{libcurl_socket})) {
+		    $cfg->{debug} && debug_message("Connection to new libcurl process on $cfg->{libcurl_socket}");
+		    last;
+		}
+		else {
+		    $cfg->{debug} && debug_message('Waiting for libcurl socket');
+		    sleep 1;
+		}
+	    }
+	}
+    }
+    return $conn;
+}
+
+sub init_curl {
+    (local $cfg, my $active_handles) = @_;
+
+    $cfg->{debug} && debug_message('Init new libcurl object');
+    my $curl = WWW::Curl::Easy->new;
+
+    # General
+    $curl->setopt(CURLOPT_USERAGENT, "apt-cacher/$version ".$curl->version);
+    $curl->setopt(CURLOPT_NOPROGRESS, 1);
+    $curl->setopt(CURLOPT_CONNECTTIMEOUT, 60);
+    $curl->setopt(CURLOPT_LOW_SPEED_LIMIT, 1);
+    $curl->setopt(CURLOPT_LOW_SPEED_TIME, $cfg->{data_timeout});
+    $curl->setopt(CURLOPT_INTERFACE, $cfg->{interface}) if defined $cfg->{interface};
+    $curl->setopt(CURLOPT_NOSIGNAL, 1);
+    $curl->setopt(CURLOPT_FOLLOWLOCATION, 1);
+
+    # DNS
+    $curl->setopt(CURLOPT_DNS_CACHE_TIMEOUT,-1);
+
+    # User config
+    foreach (keys %{$cfg->{_libcurl}}) {
+	if (my $opt = WWW::Curl::Easy::const_string(undef, 'CURLOPT_' . $_)) {
+	    my $value = $cfg->{_libcurl}{$_};
+	    $cfg->{debug} && debug_message("libcurl config CURLOPT_$_ => $value");
+	    $curl->setopt($opt, $value)
+	}
+	else {
+	    info_message("Skipping invalid libcurl option: CURLOPT_$_");
+	}
+    }
+
+    # Debug
+    $curl->setopt(CURLOPT_DEBUGFUNCTION, \&debug_callback);
+    $curl->setopt(CURLOPT_DEBUGDATA, $cfg->{debug});
+    $curl->setopt(CURLOPT_VERBOSE, $cfg->{debug} =~ /(\d+)/?$1:0); # Force numeric
+
+    # Proxy
+    $curl->setopt(CURLOPT_PROXY, ($cfg->{use_proxy} && $cfg->{http_proxy} ? $cfg->{http_proxy} : '')); # Empty string prevents setting proxy from environment
+    $curl->setopt(CURLOPT_PROXYUSERPWD, $cfg->{http_proxy_auth}) if ($cfg->{use_proxy_auth});
+	
+    if (my $rate = $cfg->{_limit}) {
+	if ($cfg->{limit_global}) {
+	    use integer;
+	    $rate /= $active_handles;
+	}
+	if ($rate) {
+	    $cfg->{debug} && debug_message("Setting bandwidth limit to $rate bytes");
+	    $curl->setopt(CURLOPT_MAX_RECV_SPEED_LARGE, $rate);
+	}
+    }
+
+    return $curl;
+}
+
+# Returns a list of candidate URLs using $cfg->{path_map}
+sub mapped_url_list {
+    my ($uri) = @_;
+
+    if ($cfg->{_path_map}{$uri->host}) {
+	my $scheme = $uri->scheme; # Use request scheme by default
+	return map {
+	    (m!^([^:/?#]+)://! ? '' :"$scheme://") . $_ . $uri->path; # Prepend scheme if missing
+	}
+	  @{$cfg->{_path_map}{$uri->host}};
+    }
+    else {
+	return $uri->as_string;
+    }
+}
+
+
+# runs the get or head operations on the user agent
+sub libcurl {
+    my ($request, $cache) = @_;
+    my $curl_request = $request->clone;
+    $curl_request->init_header('Pragma' => ''); # Override libcurl default.
+    $curl_request->init_header('Expect' => '') if $curl_request->method eq 'POST'; # Override libcurl default.
+
+    my ($response);
+
+    # iterate the possible URLs
+    foreach my $url (mapped_url_list($request->uri)) {
+	$cfg->{debug} && debug_message("Libcurl candidate: $url");
+	$curl_request->uri($url);
+	
+	# Send request to libcurl thread and wait for our result
+	undef $response; # Clear any previous attempt
+	unless (my $libcurl = connect_curlm()) {
+	    $response=HTTP::Response->new(502, 'apt-cacher: failed to connect to libcurl');
+	    $response->protocol('HTTP/1.1');
+	    info_message('Warning: apt-cacher failed to connect to libcurl');
+	}
+	else {
+	    print $libcurl freeze($curl_request, $cfg)."\n\n";
+	    my ($curl_status,$curl_errbuf,$buf,$fpid);
+	    # Loop to get the content with localised $/ So we get all the
+	    # headers at once
+	    while (local $_ = do {
+		local $/ = "\r\n\r\n" if !$response || $response->is_redirect;
+		<$libcurl>
+	    }) {
+		# $cfg->{debug} && debug_message('libcurl returned ' . length($_) . ' bytes');
+		if (s/APT-CACHER_LIBCURL_STATUS=(\d+)\n$//) { # Match and remove, including newline
+		    $curl_status = $1;
+		    $curl_errbuf = WWW::Curl::Easy->new->strerror($curl_status);
+		    $cfg->{debug} && debug_message("Found EOF marker and status $curl_status ($curl_errbuf)");
+		    last if $curl_status; # Bail out if we get a curl error
+		    # Otherwise go on to parse $_ as it will contain the file tail for binary files
+		}
+		if (!$response || ($response->is_redirect && m#^HTTP/1\.[01]\s+\d{3}\s+#)) {
+		    info_message("Got another status line. Redirected?: $_") if $response;
+		    $response=HTTP::Response->parse($_);
+		    if ($response->code) {
+			$cfg->{debug} && debug_message('libcurl reading of headers complete: ' . $response->code);
+			chomp_message($response);
+			# Handle chunked
+			if ($response->header('Transfer-Encoding') && lc $response->header('Transfer-Encoding') eq 'chunked') {
+			    # libcurl handles chunked transfer, so just remove the Transfer-Encoding header
+			    # so it doesn't get passed to clients and ignore any Content-Length header
+			    debug_message('Handle Transfer-Encoding: chunked');
+			    $response->remove_header('Transfer-Encoding');
+			    $response->remove_header('Content-Length');
+			}
+					
+			if ($curl_request->method eq 'GET' && $response->is_success) {
+
+			    # Check space
+			    my $statfs;
+			    if (defined($statfs = df($cfg->{'cache_dir'}, 1)) &&
+				$response->header('Content-Length') &&
+				$response->header('Content-Length') >=  $statfs->{bavail} ||
+				$cfg->{_disk_usage_limit} &&
+				$statfs->{used} + $response->header('Content-Length') >= $cfg->{_disk_usage_limit}) {
+				info_message('ALARM: Insuffient space for Content-Length: '.
+					     $response->header('Content-Length').
+					     ' in cache_dir with ' . $statfs->{bavail} . ' available space');
+				$response=HTTP::Response->new(503, 'apt-cacher: Cache Full');
+				$response->protocol('HTTP/1.1');
+			    }
+			    else {
+				# Take a lock on the target file and truncate
+				_flock($cache->{content}, LOCK_EX) || die 'Unable to lock the target file';
+				$cache->{content}->truncate(0) || die "Truncate failed: $!";
+				seek($cache->{content},0,0) || die "Seek failed: $!";;
+
+				defined($fpid = fork()) || die "Fork fetcher failed: $!";				
+				if  ($fpid) {
+				    # Parent
+				    $cfg->{debug} && debug_message("Forked fetcher $fpid");
+
+				    # Reopen content filedescriptor
+				    # separately. Relying on on dup(2) at fork
+				    # leaves a shared seek pointer.
+				    if (sysopen my $reopen,  fd_path($cache->{content}), O_RDWR) {
+					$cache->{content} = $reopen;
+				    }
+				    else {
+					 die "Failed to reopen content: $!";
+				    }
+
+				    if ($curl_request->method eq 'GET') {
+					if (!defined $response->content_length) {
+					    # HTTP/1.0 or HTTP/1.1 chunked server upstream
+					    # Wait for fetcher
+					    $cfg->{debug} && debug_message('No Content-Length received for '. $curl_request->uri . '. You may get better performance using a different upstream server.');
+					    _flock($cache->{content}, LOCK_SH); # Wait for the fetcher to release lock
+					    $response->content_length(-s $cache->{content});
+					}
+
+					if($cfg->{checksum}) {
+					    if (!is_file_type('installer', $request->uri->path)
+						&& !is_file_type('skip_checksum', $request->uri->path)) {
+						# check for file corruption
+						_flock($cache->{content}, LOCK_SH); # Wait for the fetcher to release lock
+						my $cached_file = filename_fh($cache->{content});
+						$cfg->{debug} && debug_message("Validating checksum for $cached_file");
+						my $refreshed_index;
+						while (!check_sum($cache->{name}, $cache->{content})) {
+						    if (is_file_type('index', $request->uri->path) && !$refreshed_index) {
+							# If an index file, refresh the Release file to update
+							# the checksum database and retry
+							info_message("Checksum mismatch on fetched $cached_file. Refreshing Release file");
+							refresh_release($request->uri);
+							$refreshed_index = 1;
+							$cfg->{debug} && debug_message("Revalidating checksum for $cached_file");
+							next;
+						    }
+						    info_message("ALARM! checksum mismatch on $cached_file");
+						    kill 15, $fpid; # Kill the fetcher as it isn't doing anything useful!
+						    _flock($cache->{content}, LOCK_UN); # Not interested in this any more but leave filesystem unlink to fetch_store()
+						    $response = HTTP::Response->new(502, 'Data corruption');
+						    $response->protocol('HTTP/1.1');
+						    last;
+						}
+					    }
+
+					    # For internal requests wait for the fetcher to finish completely
+					    # so that import_sums() has run
+					    if ($cache->{internal}) {
+						debug_message("Waiting for $fpid");
+						waitpid($fpid,0);
+					    }
+					}
+				    }
+				    last; # <$libcurl>
+				}
+				else {
+				    # Child continues to fetch
+				    setpgrp(0,0); # New process group
+				    $0="$0 [${\$request->uri}]"; # Visible to ps and friends, not local
+				    $cache->{content}->autoflush;
+				}
+			    }
+			}
+		    }
+		    else {
+			info_message("Warning: failed to parse headers: $_");
+			$response=HTTP::Response->new(502, 'apt-cacher: failed to parse headers');
+			$response->protocol('HTTP/1.1');
+		    }
+		}
+		elsif ($curl_request->method eq 'POST') {
+		    $response->add_content($_);
+		}
+		elsif ($cache->{content}) {
+		    print({$cache->{content}} $_) || do {
+			# Don't use die to avoid invoking die handler
+			info_message "Warning: print failed: $!";
+			exit;
+		    }
+		}
+	    }
+	    if (!$response) {
+		if (!defined $curl_status) {
+		    $curl_status=1;
+		    $curl_errbuf = 'Internal pipe closed prematurely';
+		}
+		if ($curl_status) { # error
+		    $response=HTTP::Response->new(502, "apt-cacher: libcurl error: $curl_errbuf");
+		    $response->protocol('HTTP/1.1');
+		    info_message('Warning: libcurl failed for ' . $curl_request->uri . ' with ' . $curl_errbuf);
+		}
+	    }
+
+	    if (defined($fpid) && $fpid==0) { # We are the fetcher
+		my $cached_file = filename_fh($cache->{content});
+		$cfg->{debug} && debug_message('stored '.$request->uri." as $cached_file");
+		_flock($cache->{content}, LOCK_UN);
+		if ($cfg->{checksum} && is_file_type('checksum', $curl_request->uri->path)) {
+		    # index file with checksums? Get checksums
+		    $cfg->{debug} && debug_message("Reading checksums from $cached_file");
+		    # warning, an attacker could poison the checksum cache easily
+		    import_sums($cache->{name}, $cache->{content});
+		}
+		exit;
+	    }
+	}
+
+	# Exit path_map loop if okay
+	last if !$response->is_error; # Success or redirect is OK
+    }
+
+    # Attach request to response
+    $response->request($curl_request);
+
+    return $response;
+}
+
+{ # Scoping block
+
+    # The most efficient version of the substitution in refresh_release() uses
+    # the \K regexp escape. This is missing in Perl versions less than 5.10.0,
+    # which instead require the Regexp::Keep module.  To prevent a compilation
+    # warning when \K is not available, keep it in a string and then use qr//.
+
+    my $k_regexp_string = '(?:dists/[^/]+/(?:updates/)?\K(?:[^/]+/){2,3})?[^/]+$';
+    my $k_regexp_compiled;
+
+    if ($] >= 5.01 or eval{require Regexp::Keep}) {
+	$k_regexp_compiled = qr/$k_regexp_string/;
+    }
+
+    sub refresh_release {
+	my ($url) = @_;
+
+	if ($k_regexp_compiled)  {
+	    # The pre-compiled qr// is used directly here. See perlop(1)
+	    $url =~ s#$k_regexp_compiled#{In,}Release#;
+	}
+	else {
+	    # Use a much slower scheme utilising 2 reverse() and 2 regexp
+	    # substitutions.
+	    $url = reverse $url;
+	    $url =~ s#^.+?/([^/]+/stsid/.+)$#X/$1#;
+	    $url =~ s#^[^/]+/#esaeleR{,nI}/#;
+	    $url = reverse $url;
+	}
+	
+	my $response;
+	foreach (glob($url)) {
+	    info_message("Refresh Release file: $_");
+	    $response = internal_request($_);
+	    last if $response->is_success;
+	}
+	return $response;
+    }
+}
+
+# Generate internal requests for URLs
+sub internal_request {
+    my($url) = @_;
+	
+    my $request = HTTP::Request->new('GET', $url, ['Cache-Control' => 'no-cache']);
+    $cfg->{debug} && debug_message('Internal request for ' . $request->uri);
+    return handle_request($request, 'INTERNAL');
+}
+
+sub soap_post {
+    my ($request,$client) = @_;
+
+    $cfg->{debug} && debug_message('POST request to '.$request->uri);
+    my $response = sendrsp(libcurl(upstream_request($request), undef));
+    write_access_log('MISS', 'SOAP POST: ' . $request->uri, $client, $response) if $response->is_success;
+    return $response;
+}
+
+sub fetch_store {
+    my ($request, $cache) = @_;
+    $request = $request->clone; # Use a copy
+    $request->method('GET'); # Always GET
+    $cfg->{debug} && debug_message('fetcher: GET '.$request->uri);
+
+    my $response = libcurl($request, $cache);
+
+    $cfg->{debug} && debug_message('libcurl returned ' . $response->code . ' for ' . $request->uri);	
+
+    if ($response->is_success) {
+	write_header($cache->{header}, $response);
+    }
+    elsif (!$request->header('If-Modified-Since')) {
+	# Not for If-Modified-Since requests to prevent deleting valid cached
+	# files after temporary errors
+	$cfg->{debug} && debug_message('Unlinking cached files');
+	unlink_by_fh($cache->{header}, $cache->{content});
+    }
+    return $response;
+}
+
+# Check if there has been a usage report generated and display it
+sub usage_report {
+    my $usage_file = "$cfg->{log_dir}/report.html";
+    my $content;
+    if (!-f $usage_file) {
+	$content = <<EOF;
+<html>
+<title>Apt-cacher traffic report</title><style type="text/css"><!--
+a { text-decoration: none; }
+a:hover { text-decoration: underline; }
+h1 { font-family: arial, helvetica, sans-serif; font-size: 18pt; font-weight: bold;}
+h2 { font-family: arial, helvetica, sans-serif; font-size: 14pt; font-weight: bold;}
+body, td { font-family: arial, helvetica, sans-serif; font-size: 10pt; }
+th { font-family: arial, helvetica, sans-serif; font-size: 11pt; font-weight: bold; }
+//--></style>
+</head>
+<body>
+<table border=0 cellpadding=8 cellspacing=1 bgcolor="#000000" align="center" width="600">
+<tr bgcolor="#9999cc"><td> <h1>Apt-cacher traffic report</h1> </td></tr>
+</td></tr>
+</table>
+
+<p><table border=0 cellpadding=3 cellspacing=1 bgcolor="#000000" align="center" width="600">
+<tr bgcolor="#9999cc"><th bgcolor="#9999cc"> An Apt-cacher usage report has not yet been generated </th></tr>
+<tr bgcolor="#cccccc"><td bgcolor="#ccccff"> Reports are generated every 24 hours. If you want reports to be generated, make sure you set '<b>generate_reports=1</b>' in <b>$cfg->{_config_file}</b>.</td></tr>
+</table>
+		</body>
+		</html>
+EOF
+    }
+    else
+      {
+	  open(my $usefile, '<', $usage_file) || die $!;
+	  local $/; # Slurp
+	  $content = <$usefile>;
+	  close($usefile);
+      }
+    return sendrsp(HTTP::Response->new(200, 'OK', ['Content-Type' => 'text/html', 'Expires' => 0, 'Connection' => 'close'], $content));
+}
+
+sub sendrsp {
+    my ($rsp) = @_;
+
+    if (ref $rsp ne 'HTTP::Response') {
+	warn 'Not a HTTP::Response object';
+	return
+    }
+
+    # Remove private headers
+    $rsp->remove_header('Client-Date');
+
+    # Defaults
+    if ($mode && $mode eq 'cgi'){
+	$rsp->protocol('Status:');
+    } else {
+	$rsp->protocol('HTTP/1.1') unless $rsp->protocol;
+    }
+    $rsp->init_header('Date' => HTTP::Date::time2str);
+    $rsp->init_header('Connection' => 'Keep-Alive');
+    $rsp->init_header('Keep-Alive' => 'timeout=15, max=100') if lc $rsp->header('Connection') eq 'keep-alive';
+    if ($rsp->code == 304) {
+	$rsp->remove_content_headers;
+    }
+    else {
+	$rsp->init_header('Content-Length' => length($rsp->content)) if $rsp->content; # Needs to be first
+	$rsp->init_header('Content-Length' => 0) if !$rsp->is_success; # We usually don't return any content for error or redirect
+    }
+    $rsp->header('Accept-Ranges' => 'bytes');
+    $rsp->header('Via' => join(', ',
+			       $rsp->header('Via'),
+			       '1.1 ' . Sys::Hostname::hostname . ($cfg->{daemon_port} ? ":$cfg->{daemon_port}" : '') . " (apt-cacher/$version)"
+			      ));
+
+    $cfg->{debug} && debug_message('Response: ' . $rsp->status_line);
+    $cfg->{debug} && debug_message('Headers: ' . $rsp->headers->as_string);
+    print $con $rsp->as_string("\r\n");
+    return $rsp;
+}
+
+# Return HTTP::Request, or true to get next request, false to exit
+sub get_request {
+
+    my $request;
+    my $tolerated_empty_lines = $cfg->{request_empty_lines};
+
+  CLIENTLINE:
+    while (1) {
+	$cfg->{debug} && debug_message('Processing a new request line');
+
+	for (get_request_line()) {
+	    last CLIENTLINE if !defined($_);
+
+	    $cfg->{debug} && debug_message("got: '$_'");
+		
+	    if(/^$/) { # End of Request Headers
+		if(defined($request)) {
+		    if ($request->method eq 'POST') {
+			if (!$request->content_length) {
+			    sendrsp(HTTP::Response->new(411, 'Content-Length not specified'));
+			    return 1; # next REQUEST
+			}
+			# Continue to get POST content
+			$cfg->{debug} && debug_message('Finished POST header, getting body');
+			my $content_ref = get_request_content($request->content_length);
+			if (length($$content_ref) != $request->content_length) {
+			    sendrsp(HTTP::Response->new(400, 'Failed to read content'));
+			    return 1; # next REQUEST
+			}
+			$request->content_ref($content_ref);
+		    }
+		    # done reading request
+		    return $request;
+		}
+		elsif(!$tolerated_empty_lines--) {
+		    sendrsp(HTTP::Response->new(400, 'Too many empty lines before request'));
+		    last CLIENTLINE;
+		}
+	    }
+	    else {
+		if(/^(GET|HEAD|POST|CONNECT)\s+(\S+)(?:\s+(HTTP\/1\.[01]))?/) {
+		    if($request) {
+			sendrsp(HTTP::Response->new(400, 'Confusing request: multiple request lines'));
+			return 1; # next REQUEST
+		    }
+		    $request = HTTP::Request->new($1,
+						  ($1 eq 'CONNECT' ? 'https://' : '') . $2);
+
+		    unless ($request) {
+			sendrsp(HTTP::Response->new(400, 'Failed to parse request'));
+			return 1; # next REQUEST
+		    }
+
+		    $request->protocol($3||'HTTP/1.0');
+
+		    clean_uri($request->uri);
+		    if($request->uri =~ m#(?:^|/)\.{2}/#) { # Reject ../ or /../
+			sendrsp(HTTP::Response->new(403, 'Forbidden: Invalid URI ' . $request->uri));
+			return 1; # next REQUEST
+		    }
+		    return $request if $mode && $mode eq 'cgi'; # Not going to get anything else
+		}
+		elsif(/^(\S+):\s+(.*)/) {
+		    if(!$request) {
+			sendrsp(HTTP::Response->new(400, 'Confusing request: headers before request line'));
+			return 1; # next REQUEST
+		    }
+		    $request->header($1 => $2);		
+		}
+		else {
+		    info_message("Failed to parse input: $_");
+		    sendrsp(HTTP::Response->new(400, "Could not understand $_"));
+		    return 1; # next REQUEST
+		}
+	    }
+	}
+    }
+    return 0;
+}
+
+sub get_request_line {
+    my $line;
+    # if executed through a CGI wrapper
+    if($mode && $mode eq 'cgi') {
+	# pick up the URL
+	my $path;
+	$path = $ENV{PATH_INFO} if !$path;
+	$path = $ENV{QUERY_STRING} if !$path;
+	$path = '/' if !$path; # set an invalid path to display usage
+	$line = "GET $path";
+    }
+    else {
+	local $/ = "\r\n";
+	for ($line = $source->getline) {
+	    chomp if defined;
+	}
+    }
+    return $line;
+}
+
+# Returns ref
+sub get_request_content {
+    my ($length) = @_;
+
+    my $r = read($source, my $content, $length);
+    if (!defined $r) {
+	die "Read content failed: $!";
+    }
+    return \$content;
+}
+
+sub get_inetd_port {
+    # Does not handle multiple entries
+    # I don't know how to find which one would be correct
+    # Just returns the first
+    my $inetdconf = '/etc/inetd.conf';
+    my $xinetdconf = '/etc/xinetd.conf';
+    my $xinetdconfdir = '/etc/xinetd.d';
+    my $port = 0;
+
+    if (-f $inetdconf && -f '/var/run/inetd.pid') {
+	open(my $fh, '<', $inetdconf) || do {
+	    info_message("Warning: Cannot open $inetdconf, $!");
+	    return;
+	    };
+	while (<$fh>) {
+	    next if /^(?:#|$)/; # Weed comments and empty lines
+	    if (/^\s*(\d+)\s+.*apt-cacher/) {
+		$port = $1;
+		last;
+	    }
+	}
+	close ($fh);
+	info_message("Warning: no apt-cacher port found in $inetdconf") if !$port;
+    }
+    if ( -f '/var/run/xinetd.pid' && -f $xinetdconfdir || -f $xinetdconf ) {
+	my $ident;
+	my $found;
+      FILE:
+	for ($xinetdconf, glob("$xinetdconfdir/*")) {
+	    open(my $fh, '<', $_) || do {
+		info_message("Warning: Cannot open $_, $!"); next;
+	    };
+	    local $_;
+	  LINE:
+	    while (<$fh>) {
+		next LINE if /^(?:#|$)/; # Weed comments and empty lines
+		if (/^\s*service\s+/) {
+		    undef $found; # New stanza, reset
+		}
+		elsif (/^\s+server(?:_args)?\s*=.*apt-cacher/) {
+		    $found = 1;
+		}
+		elsif (/^\s+port\s*=\s*(\d+)/) {
+		    $ident = $1;
+		}
+		if ($found && $ident) {
+		    $port = $ident;
+		    $cfg->{debug} && debug_message("Found xinetd port match $port");
+		    last FILE;
+		}
+	    }
+	    close ($fh);
+	}
+	info_message("Warning: no apt-cacher port found in $xinetdconf or $xinetdconfdir/*") if !$port;
+    }
+    return $port;
+}
+
+sub io_socket_inet46 {
+    my @args = @_;
+    # Test if IPv6 is available and use if it is
+    if (eval{local $SIG{__DIE__} = 'IGNORE'; # Prevent log verbosity
+	     require IO::Socket::INET6}){
+	import IO::Socket::INET6;
+	$cfg->{debug} && debug_message('Using IPv6');
+	return  IO::Socket::INET6->new(@args);
+    }
+    else {
+	return IO::Socket::INET->new(@args);
+    }
+}
+
+# BEGIN MAIN PART
+
+# Read config and command line, setup variables
+setup();
+
+# Output data as soon as we print it
+local $| = 1;
+
+#Signal Handlers
+local $SIG{CHLD} = 'IGNORE';
+local $SIG{TERM} = sub {$cfg->{debug} && debug_message('received SIGTERM, terminating'); exit};
+local $SIG{HUP} = \&reload_config;
+local $SIG{USR1} = \&toggle_debug;
+local $SIG{PIPE} = sub {$cfg->{debug} && debug_message 'Got SIGPIPE!'; exit};
+END {
+    clean_exit();
+}
+
+if($mode) {
+    open (STDERR, '>', '/dev/null') || die $!;
+    setup_ownership();
+    open_log_files();
+
+    # Install signal handlers to capture error messages
+    local $SIG{__WARN__} = sub {write_error_log("warn [$$]: ".shift)};
+    local $SIG{__DIE__} = sub {die_handler(shift)};
+
+    local $0="$0 [$mode]"; # Visible to ps and friends
+    handle_connection();
+    exit(0);
+}
+
+$listeners=IO::Select->new;
+for my $daemon_addr ($cfg->{daemon_addr} ?
+		     (grep {!/^\s*$/} # Weed empty or just whitespace
+		      (cfg_split($cfg->{daemon_addr}))) :
+		     undef # ensure run once
+		    ) {
+    my $socket;
+    my %daemonopts = (LocalPort => $cfg->{daemon_port},
+		      Proto => 'tcp',
+		      Listen => SOMAXCONN,
+		      ReuseAddr => 1);
+    $daemonopts{LocalAddr}=$daemon_addr if(defined($daemon_addr));
+
+    my $retnum = $cfg->{retry};
+    while(1) {
+	$socket = io_socket_inet46(%daemonopts);
+	last if $socket;
+	$retnum--;
+	last if($retnum<=0);
+	print STDERR "Unable to bind socket ("
+	  .($daemon_addr ? "$daemon_addr " : '')
+	    ."port $cfg->{daemon_port}), trying again in 5 seconds.\n";
+	sleep 5;
+    }
+    die "Unable to bind socket ("
+      .($daemon_addr ? "$daemon_addr " : '')
+	."port $cfg->{daemon_port}), $0 not started.\n" if ! $socket;
+    $listeners->add($socket);
+    $cfg->{debug} && debug_message("Listening on ". $socket->sockhost . ':' . $socket->sockport)
+}
+
+if ($cfg->{fork}) {
+    $cfg->{debug} && debug_message 'fork listener';
+    defined(my $pid = fork()) || die "Listener fork() failed: $!";
+    if ($pid) {
+	# parent
+	undef $listeners;
+	exit;
+    }
+    else {
+	# child
+	setpgrp(0,0); # Set process group
+	close (STDOUT);
+	open (STDOUT, '>', '/dev/null') || die $!;
+	close (STDERR);
+	open (STDERR, '>', '/dev/null') || die $!;
+	close (STDIN);
+    }
+}
+
+# This is the controlling process
+if($cfg->{pidfile}) {
+    open(my $fh, '>', $cfg->{pidfile}) || die "Unable to open $cfg->{pidfile}, $!";
+    print $fh $$;
+    close($fh);
+}
+setup_ownership();
+open_log_files();
+
+# Install signal handlers to capture error messages
+local $SIG{__WARN__} = sub {write_error_log("warn [$$]: ".shift)};
+local $SIG{__DIE__} = sub {die_handler(shift)};
+
+# State: READY
+# That is the working condition (daemon mode)
+
+$cfg->{debug} && debug_message("Apt-Cacher version $version started with Debug output enabled");
+
+while (1) {
+    foreach ($listeners->can_read) {
+	my $newcon = $_->accept;
+	# we don't stop, only by term_handler since the accept method is unreliable
+	next if(!$newcon);
+
+	$cfg->{debug} && debug_message('Connection from '.$newcon->peerhost);
+
+	defined(my $pid = fork()) || die("Handler fork() failed: $!");
+	
+	# parent
+	next if $pid;
+
+	# child
+	undef $listeners;
+	handle_connection($newcon);
+	exit(0);
+
+    }
+}
+exit(0);

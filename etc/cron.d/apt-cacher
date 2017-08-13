@@ -1,0 +1,18 @@
+# apt-cacher crontab(5) fragment
+#
+# min hour day mon dow	user	command
+
+# Run the report generator.
+# Daily.
+#
+27 4 * * *	root	test -x /usr/share/apt-cacher/apt-cacher-report.pl && /usr/share/apt-cacher/apt-cacher-report.pl
+
+# Run the cache cleaner.
+# Weekly (Sunday) by default, but reduce the frequency if this is too heavy duty for you.
+# Add -v to send root an email showing what the script has done.
+#
+37 4 * * sun	root	test -x /usr/share/apt-cacher/apt-cacher-cleanup.pl && /usr/share/apt-cacher/apt-cacher-cleanup.pl
+
+# If using the index file patching pdiff code, daily runs are more suitable.
+#
+#37 4 * * *	root	test -x /usr/share/apt-cacher/apt-cacher-cleanup.pl && /usr/share/apt-cacher/apt-cacher-cleanup.pl -p
