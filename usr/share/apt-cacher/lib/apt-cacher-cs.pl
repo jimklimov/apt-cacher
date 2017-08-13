@@ -234,6 +234,7 @@ sub import_sums {
     my ($name, $fh) = @_;
     my %temp;
     my $sem;
+    my $ret = 0;
     return unless $cfg->{checksum};
     if ($cfg->{concurrent_import_limit}) {
 	if ($sem = get_sem()) {
@@ -245,22 +246,43 @@ sub import_sums {
 	}
     }
 
+    $cfg->{debug} && debug_message("import_sums(): Waiting to read-lock file '$name' (".filename_fh($fh).")");
+    _flock($fh, LOCK_SH) || warn "import_sums(): Unable to get reading lock: $!";
     if (extract_sums($name, $fh, \%temp)) {
 	my $dbh = db();
+	my $count_ok = 0;
+	my $count_total = 0;
 	while (my ($filename,$data) = each %temp){
-	    $dbh->db_put($filename,$data) == 0 || warn "db_put $filename, $data failed with $BerkeleyDB::Error" ;
+	    $count_total++;
+	    if ( $dbh->db_put($filename,$data) == 0 ) {
+		$count_ok++;
+	    } else {
+		warn "db_put $filename, $data failed with $BerkeleyDB::Error" ;
+	    }
 	}
+	$cfg->{debug} && debug_message("import_sums(): call to extract_sums() returned $count_total values, $count_ok were successfully saved to database");
+	if ($count_total && $count_ok) {
+	    $ret = 1;	### Are zero-counts okay?..
+	}
+    } else {
+	$cfg->{debug} && debug_message("import_sums(): call to extract_sums() failed");
     }
+    _flock($fh, LOCK_UN) || warn "import_sums(): Unable to release lock: $!";
 
     # Release semaphore
     $sem->op(0, 1, SEM_UNDO) if $sem;
 
-    return;
+    return $ret;
 }
 
 # arg: name
 # arg: filehandle
 # arg: DB handle
+# Returns:
+#  0	for failure
+#  1	for success/ignore or
+#  2	for missing checksum entry (maybe success for some uses)
+#  3	some checksum value found in DB, but not for known algorithms
 sub check_sum {
     my ($name, $fh) = @_;
     return 1 unless $cfg->{checksum};
@@ -285,7 +307,8 @@ sub check_sum {
     my $dbh = db();
     if (my $status = $dbh->db_get($name, $data) != 0) { # Returns 0 on success.
 	$cfg->{debug} && debug_message("db_get for $name failed: $status ($BerkeleyDB::Error)");
-	return 1;
+	# Checksum is not in cache - not a mismatch, we return nonzero success
+	return 2;
     }
 
     my $href = hashify(\$data);
@@ -299,12 +322,13 @@ sub check_sum {
 	    else {
 		$digest = Digest::MD5->new->addfile($fh)->hexdigest;
 	    }
-	    $cfg->{debug} && debug_message("Verify $name $_: db $href->{$_}, file $digest");
+	    $cfg->{debug} && debug_message("Verify $name $_: db $href->{$_}, file $digest: CKSUM_" . ( ($href->{$_} eq $digest) ? "OK" : "MISMATCH" ) );
 	    return ($href->{$_} eq $digest);
 	}
     }
     $cfg->{debug} && debug_message("No stored checksum found for $name. Ignoring");
-    return 1;
+    ### Perhaps some checksums existed, but of unsupported type?..
+    return 3;
 }
 
 1;
