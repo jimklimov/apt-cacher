@@ -217,13 +217,14 @@ sub import_sums {
       or die "Failed to tie hash to database: $BerkeleyDB::Error\n";
 
     if (extract_sums($name, $fh, \%db)) {
-        $cfg->{debug} && debug_message("import_sums(): call to extract_sums() returned ok; got $db values");
+        my $count_sums = keys %db;
+        $cfg->{debug} && debug_message("import_sums(): call to extract_sums() returned ok; got $count_sums values");
         $ret = 1;
     } else {
         $cfg->{debug} && debug_message("import_sums(): call to extract_sums() failed");
-     }
+    }
 
-    untie %db && $ret = 1;
+    untie %db;
     _flock($fh, LOCK_UN) || warn "import_sums(): Unable to release lock: $!";
 
     # Release semaphore
