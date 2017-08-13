@@ -11,7 +11,10 @@
 # Description:       The apt-cacher service is used to cache packages for a system or LAN
 ### END INIT INFO
 # Original apt-cacher init-script modernized to run in both Debian-like
-#   AND RHEL-like AND OpenSUSE OS environments
+#   AND RHEL-like AND OpenSUSE OS environments. This file can also be
+#   used as a systemd unit exec-method, on older systems symlink it
+#   into /etc/init.d/ and configure as usual for init-scripts.
+#   DO NOT enable and run it both ways, because then they conflict.
 # -- Modernization Copyright (C) 2014-2017 by Jim Klimov <EvgenyKlimov@Eaton.com>
 #   NOTE: Remote-FS dependency added to store the actual cache on a NAS
 

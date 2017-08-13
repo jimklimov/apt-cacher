@@ -6,10 +6,10 @@ Before=nss-lookup.target nss-user-lookup.target
 
 [Service]
 Type=forking
-ExecStart=/etc/init.d/apt-cacher start
-ExecStop=/etc/init.d/apt-cacher stop
+ExecStart=/usr/share/apt-cacher/apt-cacher.init start
+ExecStop=/usr/share/apt-cacher/apt-cacher.init stop
 Restart=always
-PIDFile=/var/run/apt-cacher.pid
+PIDFile=/var/run/apt-cacher/apt-cacher.pid
 
 [Install]
 WantedBy=multi-user.target
