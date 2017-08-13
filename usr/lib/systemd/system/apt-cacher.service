@@ -1,0 +1,15 @@
+[Unit]
+Description=APT-Cacher
+After=sysinit.target
+Wants=nss-lookup.target nss-user-lookup.target
+Before=nss-lookup.target nss-user-lookup.target
+
+[Service]
+Type=forking
+ExecStart=/etc/init.d/apt-cacher start
+ExecStop=/etc/init.d/apt-cacher stop
+Restart=always
+PIDFile=/var/run/apt-cacher.pid
+
+[Install]
+WantedBy=multi-user.target
