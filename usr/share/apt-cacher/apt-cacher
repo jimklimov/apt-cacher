@@ -306,6 +306,9 @@ sub new_filename {
 	$ret =  join '_', $uri->authority, @path;
 	$cfg->{debug} && debug_message("Index file: $ret");
     }
+    else {
+	$cfg->{debug} && debug_message("Unclassified file: $uri->path");
+    }
     return $ret;
 }
 
