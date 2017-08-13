@@ -852,22 +852,124 @@ sub handle_connection {
 	    # Check complete file present
 	  complete_check:
 	    if(!$cache->{status} || $cache->{status} eq 'OFFLINE') {
-		$cfg->{debug} && debug_message('Complete check');
+		$cfg->{debug} && debug_message('Completeness check');
 		my $clength = $cached_response->content_length;
 		unless (defined $clength) {
 		    info_message('Warning: failed to read cached Content-Length');
 		    unlink_by_fh($cache->{header}, $cache->{content});
 		    goto cached_response;
 		}
+		# Flag to mark if we want to re-fetch the file (yes if zero)
+		my $goodFile=0;
 		if (-s $cache->{content} == $clength) {
-		    # not much to do if size is same as Content-Length
-		    $cfg->{debug} && debug_message("cached file is complete: $clength");
-		}
-		else {
+#		    # not much to do if size is same as Content-Length
+#		    $cfg->{debug} && debug_message("cached file is complete: $clength");
+#		}
+#		else {
+		    # Test if size is same as Content-Length
+		    $cfg->{debug} && debug_message("cached file size is complete: $clength");
+		    $goodFile=1;
+
+		    # Protect against corrupt on-disk data (older cache fetched
+		    # without checksumming, or unreliable storage subsystem)?
+		    # Note that this is a performance hit for every served file
+		    # Code initially snatched from routine for downloading from
+		    # upstream servers.
+		    if($cfg->{checksum_serve}) {
+			if (!is_file_type('installer', $request->uri->path)
+			    && !is_file_type('skip_checksum', $request->uri->path)) {
+				# check for file corruption
+				$cfg->{debug} && debug_message("Validate checksum before serving the file");
+				_flock($cache->{content}, LOCK_SH); # Wait for the fetcher to release lock
+				my $cached_file = filename_fh($cache->{content});
+				my $refreshed_index;
+				my $csResult = 1;
+				while ( ($csResult = check_sum($cache->{name}, $cache->{content})) != 1) {
+				    # Returns in $csResult may be
+				    # "0" for failure,
+				    # "1" for success or
+				    # "2"/"3" for missing checksum entry (maybe success for some uses)
+				    $cfg->{debug} && debug_message("check_sum() before serving for $cached_file returned $csResult");
+
+				    # An interesting case is if the checksum is not in the database:
+				    # This may be due to an obsolete/too new file or unparsed higher
+				    # level metadata (Packages* index, distname/Release)
+				    if (($csResult == 2 || $csResult == 3) && !$refreshed_index) {
+#					if (is_file_type('index', $request->uri->path)) {
+#					if ($request->uri->path =~ /\/(Packages|Sources)(\.gz|\.bz2|)$/ ) {
+					if (is_file_type('checksum', $request->uri->path)) {
+					    # index file with checksums is requested and absent in database?
+					    # Get checksums (later) or parse right away?..
+					    $cfg->{debug} && debug_message("... a metadata file without a cached checksum - fallthrough to get Release");
+					} else {
+					    # ordinary file, verify and maybe request higher-level ones
+					    $cfg->{debug} && debug_message("... an ordinary file without a cached checksum - try to get higher-level files");
+
+					    my $pkglistUrl = $request->uri;
+					    $pkglistUrl =~ s#^(.+/)[^/]*$#$1#;
+					    if ( $pkglistUrl =~ /\/source\// ) {
+						$pkglistUrl .= "{Sources,Packages}{,.gz,.bz2}";
+					    } else {
+						$pkglistUrl .= "{Packages}{,.gz,.bz2}";
+					    }
+					    my $response;
+					    foreach (glob($pkglistUrl)) {
+						# First, verify relevant Packages - if present and good, then they have been parsed (suck in if missing)
+						# TODO: Convert URI to path and feed that to check_sum()
+						#? my $cached_file = filename_fh($cache->{content});
+
+						# if ... next;
+						info_message("Checksum missing for fetched $cached_file. Refreshing Packages and Release files");
+
+						# Second, request and suck in Release (by recursion) and Packages if Packages were bad
+						info_message("Refresh index file: $_");
+						$response = internal_request($_);
+						last if $response->is_success;
+					    }
+					    if ( !$response->is_success ) {
+						refresh_release($request->uri);
+					    }
+					    $refreshed_index = 1;
+					    $cfg->{debug} && debug_message("Revalidating checksum for $cached_file");
+					    next;
+					}
+				    } # // if cksum not in db
+
+				    # The usual logic: mismatch means data may be obsolete or corrupt;
+				    # for requests of indexes refresh distribution metadata once and retry loop
+				    if (is_file_type('index', $request->uri->path) && !$refreshed_index) {
+					# If an index file, refresh the Release file to update
+					# the checksum database and retry
+					info_message("Checksum mismatch or database miss on fetched metadata $cached_file. Refreshing Release file");
+					refresh_release($request->uri);
+					$refreshed_index = 1;
+					$cfg->{debug} && debug_message("Revalidating checksum for metadata $cached_file");
+					next;
+				    } # //if index refresh
+
+				    if ($csResult == 0) {
+					info_message("ALARM! checksum mismatch on $cached_file discovered while serving");
+					$goodFile=0;
+					_flock($cache->{content}, LOCK_UN); # Not interested in this any more but leave filesystem unlink to fetch_store()
+					$response = HTTP::Response->new(502, 'Data corruption discovered while serving');
+					$response->protocol('HTTP/1.1');
+				    } else {
+					info_message("checksum not cached for $cached_file, so serving what we have");
+				    } # //if bad or missing?
+				    last;
+				} # //while mismatched
+			} # //if not skip testing checksums
+		    } # //if retest checksums
+		} # //if file size is as expected
+
+		if ($goodFile == 0) {
 		    # a fetcher was either not successful or is still running
 		    # look for activity...
 		    if (flock($cache->{content}, LOCK_SH|LOCK_NB)) {
-			_flock($cache->{content}, LOCK_UN);
+			# Quickly opened for reading... that was just a test
+			# that the file is not being written into; release now.
+#			_flock($cache->{content}, LOCK_UN);
+			flock($cache->{content}, LOCK_UN);
 			# No fetcher working on this package. Redownload it.
 			$cfg->{debug} && debug_message('Incomplete, no fetcher running, downloading');
 			$cache->{status} = 'MISS'; # Force download
@@ -1611,7 +1713,8 @@ sub connect_curlm {
 			my $active_transfers = $curlm->perform;
 			if ($active_transfers != $active_handles) {
 			    while (my ($id,$return_value) = $curlm->info_read)  {
-				$cfg->{debug} && debug_message("curl handle #$id completed, status: $return_value");
+#				$cfg->{debug} && debug_message("curl handle #$id completed, status: $return_value");
+				$cfg->{debug} && debug_message("curl handle #$id for " . $request->uri . " completed, status: $return_value");
 				$active_handles--;
 				my($client_socket,$client_curl)=@{$easy{$id}};
 				print $client_socket "APT-CACHER_LIBCURL_STATUS=$return_value\r\n\r\n", $client_curl->strerror($return_value);
@@ -1845,6 +1948,7 @@ sub libcurl {
 			}
 			else {
 			    # Take a lock on the target file and truncate
+			    $cfg->{debug} && debug_message("libcurl(): lock on target ". $curl_request->uri);
 			    _flock($cache->{content}, LOCK_EX) || die 'Unable to lock the target file';
 			    $cache->{content}->truncate(0) || die "Truncate failed: $!";
 			    seek($cache->{content},0,0) || die "Seek failed: $!";;
@@ -1869,7 +1973,9 @@ sub libcurl {
 					# HTTP/1.0 or HTTP/1.1 chunked server upstream
 					# Wait for fetcher
 					$cfg->{debug} && debug_message('No Content-Length received for '. $curl_request->uri . '. You may get better performance using a different upstream server.');
+					$cfg->{debug} && debug_message("libcurl(): Waiting to lock ". $curl_request->uri);
 					_flock($cache->{content}, LOCK_SH); # Wait for the fetcher to release lock
+					$cfg->{debug} && debug_message("libcurl(): Locked ". $curl_request->uri);
 					$response->content_length(-s $cache->{content});
 				    }
 
@@ -1878,7 +1984,9 @@ sub libcurl {
 					    && !is_file_type('installer', $request->uri->path)
 					    && !is_file_type('skip_checksum', $request->uri->path)) {
 					    # check for file corruption
+					    $cfg->{debug} && debug_message("libcurl(): Waiting to lock ". $curl_request->uri);
 					    _flock($cache->{content}, LOCK_SH); # Wait for the fetcher to release lock
+					    $cfg->{debug} && debug_message("libcurl(): Locked ". $curl_request->uri);
 					    my $cached_file = filename_fh($cache->{content});
 					    $cfg->{debug} && debug_message("Validating checksum for $cached_file");
 					    my $refreshed_index;
@@ -1895,6 +2003,7 @@ sub libcurl {
 						info_message("ALARM! checksum mismatch on $cached_file");
 						kill 15, $fpid; # Kill the fetcher as it isn't doing anything useful!
 						_flock($cache->{content}, LOCK_UN); # Not interested in this any more but leave filesystem unlink to fetch_store()
+						$cfg->{debug} && debug_message("libcurl(): Unlocked ". $curl_request->uri);
 						$response = HTTP::Response->new(502, 'Data corruption', ['Connection' => 'close']);
 						$response->protocol('HTTP/1.1');
 						sendrsp($response);
@@ -1951,6 +2060,7 @@ sub libcurl {
 	    if (defined($fpid) && $fpid==0) { # We are the fetcher
 		my $cached_file = filename_fh($cache->{content});
 		$cfg->{debug} && debug_message('stored '.$request->uri." as $cached_file");
+		$cfg->{debug} && debug_message("libcurl() fetcher: Unlocked ". $curl_request->uri);
 		_flock($cache->{content}, LOCK_UN);
 
 		# just inspect contents - that it has no HTTP ERRORS inside

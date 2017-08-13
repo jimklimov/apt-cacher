@@ -236,7 +236,7 @@ sub cfg_split {
     my ($item) = @_;
     return $item ? grep {length} # Remove empty
       map {(my $s = $_) =~ s#\\(?=[,;])##g; $s} # Normalise escaped separators
-	split(/\s*(?<!\\)[,;]\s*/, $item) : undef;
+        split(/\s*(?<!\\)[,;]\s*/, $item) : undef;
 }
 
 sub private_config {
@@ -527,21 +527,72 @@ sub _flock {
     my ($fh, $flags) = @_;
 
     my $ret;
-    unless ($ret = flock($fh, $flags | LOCK_NB)) {
-	if ($cfg->{debug}) {
+#    unless ($ret = flock($fh, $flags | LOCK_NB)) {
+#	if ($cfg->{debug}) {
+    my $flags_str;
+    my $caller_str;
+    my $fh_name;
+    my $dodebug = 0;
+    if ($cfg->{debug_flock} && defined &debug_message) {
+	    $fh_name=filename_fh($fh);
+	    for my $file ("$cfg->{log_dir}/access.log", "$cfg->{log_dir}/error.log") {
+		    if ( $fh_name eq $file ) { goto DOFLOCK; }
+	    }
+	    $dodebug = 1;
+
+	    # Prepare debugging strings if asked to...
+	    my ($package, $filename, $line, $subroutine,
+		$hasargs, $wantarray, $evaltext, $is_require,
+		$hints, $bitmask, $hinthash) = caller (1);
+	    $caller_str = "_FLOCK($fh_name) called from "
+#			    . $package . "::" 
+			    . $filename 
+			    . "[" . $line . "]" 
+			    . $subroutine . "()"; 
+
 	    # Hash for decoding flag symbols.
 	    #
 	    # __PACKAGE__->$sym references flock constants without needing to
 	    # disable strict refs
 	    my %h = map {$_ => __PACKAGE__->$_} glob("LOCK_{SH,EX,UN,NB}");
-	    debug_message('Waiting for '
-			  . join ('|', grep {$h{$_} & $flags && $_} keys %h)
-			  . ' on '
-			  . filename_fh($fh)) if defined &debug_message && $cfg->{debug};
+#	    debug_message('Waiting for '
+#			  . join ('|', grep {$h{$_} & $flags && $_} keys %h)
+#			  . ' on '
+#			  . filename_fh($fh)) if defined &debug_message && $cfg->{debug};
+	    $flags_str=join ('|', grep {$h{$_} & $flags && $_} keys %h);
+	    # Filter out some (un)locks, like the log
+	    # file we are writing into to report this line
+	    if ( ($flags&LOCK_UN) ) {
+		    debug_message("$caller_str : RELEASING");
+#	    } else {
+#		    debug_message("$caller_str : Trying to quickly get $flags_str");
+	    }
+    }
+DOFLOCK:
+    unless ($ret = flock($fh, $flags | LOCK_NB)) {
+	if ($dodebug) {
+	    debug_message("$caller_str : WAITING for $flags_str");
 	}
         $ret = flock($fh, $flags);
-	debug_message('Got it!') if defined &debug_message && $cfg->{debug};
+#	debug_message('Got it!') if defined &debug_message && $cfg->{debug};
     }
+
+    if ($dodebug) {
+	if ($ret) {
+	    if ( ($flags&LOCK_UN) ) {
+		debug_message("$caller_str : RELEASED");
+	    } else {
+		debug_message("$caller_str : GOT $flags_str");
+	    }
+	} else {
+	    if ( ($flags&LOCK_UN) ) {
+		debug_message("$caller_str : FAILED to RELEASE");
+	    } else {
+		debug_message("$caller_str : FAILED to get $flags_str");
+	    }
+	}
+    }
+
     return $ret;
 }
 
@@ -683,11 +734,13 @@ sub get_original_url {
 sub extract_sums {
    my ($name, $fh, $hashref) = @_;
 
+   my $fh_opened = 0;
    if ($fh) {
        seek($fh,0,0) || die "Seek failed: $!";
    }
    else {
        open($fh, '<', $name) || die "Open $name failed: $!";
+       $fh_opened = 1;
    }
 
    my $raw = IO::Uncompress::AnyUncompress->new($fh)
@@ -779,6 +832,9 @@ sub extract_sums {
 	   undef %data; # Reset
        }
    };
+   if ($fh_opened) {
+       close($fh) || warn "Problem closing $name";
+   }
    if ($AnyUncompressError) {
        warn "$name Read failed: $AnyUncompressError. Aborting read\n";
        return;
