@@ -924,6 +924,7 @@ sub is_file_type {
     my ($type,$file) = @_;
     $type .= '_files_regexp';
     die "Regexp $type not defined in config" if !exists($cfg->{$type});
+#    debug_message("is_file_type() matching file '$file' against '$type' regex '$cfg->{$type}'") if defined &debug_message && $cfg->{debug};
     return ($file =~ $cfg->{$type});
 }
 
