@@ -739,6 +739,7 @@ sub handle_connection {
 	    unlink $cached_file.".tmp";
 	    sysopen($cache->{content}, $cached_file . ".tmp", O_RDWR|O_CREAT)
 	      || die "Failed to open/create $cached_file.tmp for return: $!";
+	    $cfg->{debug} && debug_message("Created temporary file $cached_file.tmp");
 	}
 
 	# Existing response
@@ -865,11 +866,7 @@ sub handle_connection {
 		# Flag to mark if we want to re-fetch the file (yes if zero)
 		my $goodFile=0;
 		if (-s $cache->{content} == $clength) {
-#		    # not much to do if size is same as Content-Length
-#		    $cfg->{debug} && debug_message("cached file is complete: $clength");
-#		}
-#		else {
-		    # Test if size is same as Content-Length
+		    # Tested if size is same as Content-Length
 		    $cfg->{debug} && debug_message("cached file size is complete: $clength");
 		    $goodFile=1;
 
@@ -991,6 +988,7 @@ sub handle_connection {
 	}
 
 	if (!$response) {
+	    my $cached_file_tmp = filename_fh($cache->{content});
 	    # bypass for offline mode, no forking, just report the "problem"
 	    if($cfg->{offline_mode})
 	      {
@@ -998,7 +996,7 @@ sub handle_connection {
 	      }
 	    else {
 		# (re) download them
-		$cfg->{debug} && debug_message('file does not exist or download required');
+		$cfg->{debug} && debug_message("file '$cached_file_tmp' does not exist or download required");
 
 		# Set the status to MISS so the log file can show it had to be downloaded
 		# except on special presets from index file checks above
@@ -1006,7 +1004,12 @@ sub handle_connection {
 		    $cache->{status} = 'MISS';
 		    $cfg->{debug} && debug_message($cache->{status});
 		}
+		$cfg->{debug} && debug_message("call fetch_store(upstream_request($request), $cache);");
 		$response = fetch_store(upstream_request($request), $cache);
+		# Note: this routine exits the handling forked process upon
+		# errors like unreachable site, so we retain empty .tmp files...
+		# They will be wiped during a next attempt.
+		$cfg->{debug} && debug_message("returned from fetch_store(upstream_request($request), $cache);");
 	    }
 	}
 
@@ -1017,6 +1020,10 @@ sub handle_connection {
 	    my $num=0;
 	    my $cached_file_tmp = filename_fh($cache->{content});
 	    my $cached_file = "$cfg->{cache_dir}/packages/$cache->{name}";
+
+   	    $cfg->{debug} && debug_message("Verifying whether to replace old '$cached_file' by new '$cached_file_tmp'");
+
+
 	    # just inspect contents - that it has no HTTP ERRORS inside
 	    sysseek($fhT,0,0);
 	    seek($fhT,0,0);
@@ -1036,7 +1043,23 @@ sub handle_connection {
 	    }
 
 	    if ( $cached_file_tmp ne "" ) {
-		if (1==1) {
+		if (! -s $cached_file_tmp ) {
+		    $cfg->{debug} && debug_message("Newly fetched file $cached_file_tmp is empty, removing");
+		    unlink $cached_file_tmp;
+		    $cached_file_tmp = "";
+		}
+	    }
+
+	    if ( $cached_file ne "" ) {
+		if (! -s $cached_file ) {
+		    $cfg->{debug} && debug_message("Existing file $cached_file is empty, removing");
+		    unlink $cached_file;
+		    $cached_file = "";
+		}
+	    }
+
+	    if ( $cached_file_tmp ne "" && $cached_file ne "") {
+		if ($cfg->{difftmp_system}) {
 		    # Just call external diff
 		    $cfg->{debug} && debug_message("Comparing whether $cached_file_tmp is different from existing $cached_file");
 		    system ("diff", "$cached_file_tmp", "$cached_file");
@@ -1050,62 +1073,64 @@ sub handle_connection {
 			    || die "Failed to re-open/create $cached_file for return: $!";
 		    } else { # diff
 			# Files are different
-			$cfg->{debug} && debug_message("$cached_file does not exist or has different content from newly fetched $cached_file_tmp, replacing");
+			$cfg->{debug} && debug_message("$cached_file has different content from newly fetched and verified $cached_file_tmp, replacing");
 			# Fall through to unlink+rename
 		    }
-		} else { # else for hack-flag
-		# Try to diff inside perl
-		if (sysopen($fhO, $cached_file, O_RDONLY)) {
-#		    if ( -s $cached_file == -s $cached_file_tmp) {
-			$cfg->{debug} && debug_message("Comparing whether $cached_file_tmp is different from existing $cached_file");
-			binmode $fhT or die "Can't binmode $cached_file_tmp";
-			binmode $fhO or die "Can't binmode $cached_file";
-			sysseek($fhT,0,0);
-			seek($fhT,0,0);
-			sysseek($fhO,0,0);
-			seek($fhO,0,0);
-			local $/ = \ 4096;
-			while (<$fhT> eq <$fhO>) {
-			    $num++;
-			}
-			$cfg->{debug} && debug_message("Compared $num iterations");
-			if ( eof $fhT and eof $fhO ) {
-			    # Both files ended at once and no differences found
-			    $cfg->{debug} && debug_message("Existing file $cached_file has same content as newly fetched $cached_file_tmp, keeping old");
-			    $cache->{status} = 'HIT';
-			    unlink $cached_file_tmp;
-			    $cached_file_tmp = "";
-			    close($fhT);
-			    close($fhO);
-			    # Fall through to old cached file
-			    sysopen($cache->{content}, $cached_file, O_RDWR|O_CREAT)
-				|| die "Failed to re-open/create $cached_file for return: $!";
-			} else {
-			    # Files are different
-			    if ($cfg->{debug}) {
-				debug_message("Existing file $cached_file has different content from newly fetched $cached_file_tmp, replacing");
+		} else {
+		    # Try to diff inside perl
+		    if (sysopen($fhO, $cached_file, O_RDONLY)) {
+#			if ( -s $cached_file == -s $cached_file_tmp ) {
+			    $cfg->{debug} && debug_message("Comparing whether $cached_file_tmp is different from existing $cached_file");
+			    binmode $fhT or die "Can't binmode $cached_file_tmp";
+			    binmode $fhO or die "Can't binmode $cached_file";
+			    sysseek($fhT,0,0);
+			    seek($fhT,0,0);
+			    sysseek($fhO,0,0);
+			    seek($fhO,0,0);
+			    local $/ = \ 4096;
+			    while (<$fhT> eq <$fhO>) {
+			        $num++;
+			    }
+			    $cfg->{debug} && debug_message("Compared $num iterations");
+			    if ( eof $fhT and eof $fhO ) {
+			        # Both files ended at once and no differences found
+			        $cfg->{debug} && debug_message("Existing file $cached_file has same content as newly fetched $cached_file_tmp, keeping old");
+			        $cache->{status} = 'HIT';
+			        unlink $cached_file_tmp;
+			        $cached_file_tmp = "";
+			        close($fhT);
+			        close($fhO);
+			        # Fall through to old cached file
+			        sysopen($cache->{content}, $cached_file, O_RDWR|O_CREAT)
+			            || die "Failed to re-open/create $cached_file for return: $!";
+			    } else {
+			        # Files are different
+			        if ($cfg->{debug}) {
+				debug_message("Existing file $cached_file has different content from newly fetched and verified $cached_file_tmp, replacing");
 				debug_message("  eofT: " .eof $fhT);
 				debug_message("  eofO: " .eof $fhO);
 				debug_message("  defT: " .defined(<$fhT>) );
 				debug_message("  defO: " .defined(<$fhO>) );
-			    }
-			    close($fhO);
+			        }
+			        close($fhO);
 			    # Fall through to unlink+rename
-			}
-#		    } else {
-#			# Files are different in size
-#			if ($cfg->{debug}) {
-#			    debug_message("Existing file $cached_file has different size from newly fetched $cached_file_tmp, replacing");
-#			    debug_message("  szT: ", (-s $cached_file_tmp));
-#			    debug_message("  szO: ", (-s $cached_file));
-#			}
-#			close($fhO);
-#			# Fall through to unlink+rename
-#		    }
-		} else {
-		    $cfg->{debug} && debug_message("No existing $cached_file located, replacing with newly fetched $cached_file_tmp");
-		}
-		}
+			    }
+#			} else {
+#			    # Files are different in size
+#			    if ($cfg->{debug}) {
+#				debug_message("Existing file $cached_file has different size from newly fetched $cached_file_tmp, replacing");
+#				debug_message("  szT: ", (-s $cached_file_tmp));
+#				debug_message("  szO: ", (-s $cached_file));
+#			    }
+#			    close($fhO);
+#			    # Fall through to unlink+rename
+#			} # If different size
+		    } # If sysopen()
+		} # which diff method
+	    } # if both names are present
+
+	    if ( $cached_file_tmp ne "" && $cached_file eq "") {
+		$cfg->{debug} && debug_message("No existing $cached_file located, replacing with newly fetched $cached_file_tmp");
 	    }
 
 	    if ( $cached_file_tmp ne "" ) {
