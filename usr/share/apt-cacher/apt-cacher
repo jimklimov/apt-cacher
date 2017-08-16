@@ -1088,8 +1088,14 @@ sub handle_connection {
 			    sysseek($fhO,0,0);
 			    seek($fhO,0,0);
 			    local $/ = \ 4096;
-			    while (<$fhT> eq <$fhO>) {
-			        $num++;
+			    my $line_fhT="";
+			    my $line_fh0="";
+			    while (defined($line_fhT) && defined($line_fh0) && $line_fhT eq $line_fh0) {
+				$line_fhT = <$fhT>;
+				$line_fh0 = <$fhO>;
+				if (defined($line_fhT) && defined($line_fh0) && $line_fhT eq $line_fh0) {
+				    $num++;
+				}
 			    }
 			    $cfg->{debug} && debug_message("Compared $num iterations");
 			    if ( eof $fhT and eof $fhO ) {
